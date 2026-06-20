@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest an improvement for the remote companion prototype.
+title: "[Feature]: "
+labels: enhancement
+
+body:
+  - type: textarea
+    attributes:
+      label: Description
+      description: What would you like the app to do?
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Use case
+      description: What workflow would this improve?
+
+  - type: textarea
+    attributes:
+      label: Alternatives considered
+      description: Mention any simpler workaround or existing tool you compared against.
+
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Add screenshots or examples if useful, but remove private data.
