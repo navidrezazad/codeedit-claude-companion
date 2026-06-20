@@ -7,6 +7,7 @@
 
 import Darwin
 import Foundation
+import SwiftTerm
 
 protocol CELocalShellTerminalViewSessionDelegate: AnyObject {
     func terminalView(_ terminalView: CELocalShellTerminalView, didReceiveOutput bytes: ArraySlice<UInt8>)
@@ -24,9 +25,23 @@ struct TerminalSessionDescriptor: Identifiable, Equatable {
     let rows: Int?
 }
 
+struct TerminalProjectedSpan: Equatable {
+    let text: String
+    let foreground: Int?
+    let background: Int?
+    let style: Int
+}
+
 struct TerminalProjectedRow {
     let row: Int
     let text: String
+    let spans: [TerminalProjectedSpan]
+
+    init(row: Int, text: String, spans: [TerminalProjectedSpan] = []) {
+        self.row = row
+        self.text = text
+        self.spans = spans
+    }
 }
 
 struct TerminalProjectedOutput {
@@ -70,7 +85,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var inputSubscribers: [UUID: ByteHandler] = [:]
     private var projectedOutputSubscribers: [UUID: ProjectedOutputHandler] = [:]
     private var rawOutputSubscribers: [UUID: RawOutputHandler] = [:]
-    private var projectedRows: [Int: String] = [:]
+    private var projectedRows: [Int: ProjectedRowContent] = [:]
     private var projectedOutputSequence = 0
     private var screenMode: TerminalRemoteProtocol.ScreenMode = .main
     private var terminalControlTail = ""
@@ -141,12 +156,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         let rows = projectedRows.keys
             .sorted()
             .compactMap { row -> TerminalProjectedRow? in
-                guard let text = projectedRows[row],
-                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                guard let content = projectedRows[row],
+                      !content.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     return nil
                 }
 
-                return TerminalProjectedRow(row: row, text: text)
+                return TerminalProjectedRow(row: row, text: content.text, spans: content.spans)
             }
 
         guard !rows.isEmpty else {
@@ -209,13 +224,13 @@ final class TerminalSession: ObservableObject, Identifiable {
                 continue
             }
 
-            let text = line.translateToString(trimRight: true)
-            guard projectedRows[row] != text else {
+            let content = Self.projectedRowContent(from: line)
+            guard projectedRows[row] != content else {
                 continue
             }
 
-            projectedRows[row] = text
-            rows.append(TerminalProjectedRow(row: row, text: text))
+            projectedRows[row] = content
+            rows.append(TerminalProjectedRow(row: row, text: content.text, spans: content.spans))
         }
 
         guard !rows.isEmpty else {
@@ -285,6 +300,142 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
 
         return latestChange?.mode
+    }
+
+    /// Cached styled contents of a single projected row, used both for change detection and for the
+    /// "recent output" snapshot sent on attach.
+    private struct ProjectedRowContent: Equatable {
+        let text: String
+        let spans: [TerminalProjectedSpan]
+    }
+
+    /// Builds the plain text and run-length-encoded styled spans for a SwiftTerm buffer line,
+    /// mirroring `translateToString(trimRight:)` while also capturing ANSI color/style.
+    private static func projectedRowContent(from line: BufferLine) -> ProjectedRowContent {
+        let trimmedLength = line.getTrimmedLength()
+        guard trimmedLength > 0 else {
+            return ProjectedRowContent(text: "", spans: [])
+        }
+
+        var spans: [TerminalProjectedSpan] = []
+        var text = ""
+        var currentText = ""
+        var currentKey: SpanKey?
+
+        func flush() {
+            guard let key = currentKey, !currentText.isEmpty else {
+                return
+            }
+            spans.append(
+                TerminalProjectedSpan(
+                    text: currentText,
+                    foreground: key.foreground,
+                    background: key.background,
+                    style: key.style
+                )
+            )
+            currentText = ""
+        }
+
+        var column = 0
+        while column < trimmedLength {
+            let cell = line[column]
+            column += 1
+
+            // Skip the trailing placeholder cell of a wide (2-column) character.
+            if cell.width == 0 {
+                continue
+            }
+
+            let rawCharacter = cell.getCharacter()
+            let character: Character = rawCharacter == "\0" ? " " : rawCharacter
+            let key = SpanKey(attribute: cell.attribute)
+            if key != currentKey {
+                flush()
+                currentKey = key
+            }
+            currentText.append(character)
+            text.append(character)
+        }
+        flush()
+
+        return ProjectedRowContent(text: text, spans: spans)
+    }
+
+    /// Resolved color/style for a cell, used to coalesce equally-styled neighbors into one span.
+    private struct SpanKey: Equatable {
+        let foreground: Int?
+        let background: Int?
+        let style: Int
+
+        init(attribute: Attribute) {
+            var style = 0
+            let cellStyle = attribute.style
+            if cellStyle.contains(.bold) { style |= TerminalRemoteProtocol.SpanStyle.bold }
+            if cellStyle.contains(.italic) { style |= TerminalRemoteProtocol.SpanStyle.italic }
+            if cellStyle.contains(.underline) { style |= TerminalRemoteProtocol.SpanStyle.underline }
+            if cellStyle.contains(.crossedOut) { style |= TerminalRemoteProtocol.SpanStyle.strikethrough }
+            if cellStyle.contains(.dim) { style |= TerminalRemoteProtocol.SpanStyle.dim }
+            self.style = style
+
+            var foreground = Self.packedColor(attribute.fg)
+            var background = Self.packedColor(attribute.bg)
+
+            if cellStyle.contains(.inverse) {
+                let resolvedForeground = foreground ?? TerminalRemoteProtocol.defaultForegroundRGB
+                let resolvedBackground = background ?? TerminalRemoteProtocol.defaultBackgroundRGB
+                foreground = resolvedBackground
+                background = resolvedForeground
+            }
+
+            if cellStyle.contains(.invisible) {
+                foreground = background
+            }
+
+            self.foreground = foreground
+            self.background = background
+        }
+
+        private static func packedColor(_ color: Attribute.Color) -> Int? {
+            switch color {
+            case .defaultColor, .defaultInvertedColor:
+                return nil
+            case let .trueColor(red, green, blue):
+                return (Int(red) << 16) | (Int(green) << 8) | Int(blue)
+            case let .ansi256(code):
+                return TerminalANSIPalette.packed[Int(code)]
+            }
+        }
+    }
+}
+
+/// The standard 256-entry xterm palette as packed `0xRRGGBB` integers. The first 16 entries match
+/// SwiftTerm's default installed ANSI colors so the iPhone shows the same hues as the Mac terminal.
+private enum TerminalANSIPalette {
+    static let packed: [Int] = build()
+
+    private static func build() -> [Int] {
+        var colors: [Int] = [
+            0x0000_0000, 0x0099_0001, 0x0000_A603, 0x0099_9900,
+            0x0003_00B2, 0x00B2_00B2, 0x0000_A5B2, 0x00BF_BFBF,
+            0x008A_898A, 0x00E5_0001, 0x0000_D800, 0x00E5_E500,
+            0x0007_00FE, 0x00E5_00E5, 0x0000_E5E5, 0x00E5_E5E5
+        ]
+
+        let levels = [0x00, 0x5F, 0x87, 0xAF, 0xD7, 0xFF]
+        for index in 0..<216 {
+            let red = levels[(index / 36) % 6]
+            let green = levels[(index / 6) % 6]
+            let blue = levels[index % 6]
+            colors.append((red << 16) | (green << 8) | blue)
+        }
+
+        for index in 0..<24 {
+            let value = 8 + index * 10
+            colors.append((value << 16) | (value << 8) | value)
+        }
+
+        return colors
     }
 }
 

@@ -7,6 +7,10 @@
 
 import SwiftUI
 import WebKit
+import UIKit
+import AVFoundation
+
+// swiftlint:disable file_length
 
 private enum TerminalDisplayMode: String, CaseIterable, Identifiable {
     case terminal = "Terminal"
@@ -21,6 +25,7 @@ private enum TerminalDisplayMode: String, CaseIterable, Identifiable {
     }
 }
 
+// swiftlint:disable:next type_body_length
 struct ContentView: View {
     private enum AppTab: Hashable {
         case terminals
@@ -31,6 +36,8 @@ struct ContentView: View {
     @StateObject private var client = RemoteTerminalClient()
     @State private var selectedTab = AppTab.terminals
     @State private var terminalDisplayMode = TerminalDisplayMode.terminal
+    @State private var isShowingScanner = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
@@ -45,6 +52,20 @@ struct ContentView: View {
         }
         .onAppear {
             client.startBrowsing()
+            client.attemptAutoReconnect()
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                client.attemptAutoReconnect()
+            }
+        }
+        .onChange(of: client.isAuthenticated) { _, isAuthenticated in
+            if isAuthenticated {
+                Haptics.success()
+            }
+        }
+        .onOpenURL { url in
+            client.handlePairingURL(url)
         }
     }
 
@@ -117,6 +138,16 @@ struct ContentView: View {
 
     private var connectionView: some View {
         List {
+            Section {
+                Button {
+                    isShowingScanner = true
+                } label: {
+                    Label("Scan Pairing QR", systemImage: "qrcode.viewfinder")
+                }
+            } footer: {
+                Text("Open CodeEditV2 ▸ Settings ▸ General on your Mac and scan the pairing QR to fill in the address and passcode automatically.")
+            }
+
             Section("Local Network") {
                 if client.hosts.isEmpty {
                     Label(client.statusMessage, systemImage: "network")
@@ -183,6 +214,38 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .sheet(isPresented: $isShowingScanner) {
+            pairingScannerSheet
+        }
+    }
+
+    private var pairingScannerSheet: some View {
+        NavigationStack {
+            QRScannerView { code in
+                isShowingScanner = false
+                if let url = URL(string: code) {
+                    Haptics.success()
+                    client.handlePairingURL(url)
+                }
+            }
+            .ignoresSafeArea(edges: .bottom)
+            .overlay(alignment: .bottom) {
+                Text("Point the camera at the pairing QR on your Mac")
+                    .font(.callout)
+                    .padding(10)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(.bottom, 24)
+            }
+            .navigationTitle("Scan Pairing QR")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Cancel") {
+                        isShowingScanner = false
+                    }
+                }
+            }
+        }
     }
 
     private var terminalView: some View {
@@ -201,10 +264,37 @@ struct ContentView: View {
             if terminalDisplayMode.showsInputBar {
                 VStack(spacing: 0) {
                     Divider()
+                    terminalKeyBar
+                    Divider()
                     terminalInputBar
                 }
                 .background(Color(uiColor: .systemBackground))
             }
+        }
+    }
+
+    private var terminalKeyBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(TerminalControlKey.all) { key in
+                    Button {
+                        Haptics.tap()
+                        client.sendInput(Data(key.bytes))
+                    } label: {
+                        Text(key.label)
+                            .font(.caption.weight(.medium))
+                            .frame(minWidth: 26)
+                            .padding(.vertical, 5)
+                            .padding(.horizontal, 6)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(client.selectedSessionID == nil)
+                    .accessibilityLabel(key.accessibilityLabel)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
         }
     }
 
@@ -939,4 +1029,168 @@ struct MarkdownWebView: UIViewRepresentable {
 
 #Preview {
     ContentView()
+}
+
+/// A control/special key sent to the terminal as raw bytes through the normal input path.
+private struct TerminalControlKey: Identifiable {
+    let label: String
+    let bytes: [UInt8]
+    let accessibilityLabel: String
+
+    var id: String { label }
+
+    static let all: [TerminalControlKey] = [
+        .init(label: "esc", bytes: [0x1B], accessibilityLabel: "Escape"),
+        .init(label: "tab", bytes: [0x09], accessibilityLabel: "Tab"),
+        .init(label: "⌃C", bytes: [0x03], accessibilityLabel: "Control C"),
+        .init(label: "⌃D", bytes: [0x04], accessibilityLabel: "Control D"),
+        .init(label: "⌃Z", bytes: [0x1A], accessibilityLabel: "Control Z"),
+        .init(label: "⌃L", bytes: [0x0C], accessibilityLabel: "Clear screen"),
+        .init(label: "↑", bytes: [0x1B, 0x5B, 0x41], accessibilityLabel: "Up arrow"),
+        .init(label: "↓", bytes: [0x1B, 0x5B, 0x42], accessibilityLabel: "Down arrow"),
+        .init(label: "←", bytes: [0x1B, 0x5B, 0x44], accessibilityLabel: "Left arrow"),
+        .init(label: "→", bytes: [0x1B, 0x5B, 0x43], accessibilityLabel: "Right arrow")
+    ]
+}
+
+/// Lightweight haptic feedback helpers for connection and key events.
+enum Haptics {
+    static func tap() {
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.impactOccurred()
+    }
+
+    static func success() {
+        let generator = UINotificationFeedbackGenerator()
+        generator.notificationOccurred(.success)
+    }
+}
+
+/// A minimal AVFoundation-backed QR scanner that reports the first decoded string value.
+struct QRScannerView: UIViewControllerRepresentable {
+    let onCode: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onCode: onCode)
+    }
+
+    func makeUIViewController(context: Context) -> ScannerViewController {
+        let controller = ScannerViewController()
+        controller.coordinator = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: ScannerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, AVCaptureMetadataOutputObjectsDelegate {
+        private let onCode: (String) -> Void
+        private var didEmit = false
+
+        init(onCode: @escaping (String) -> Void) {
+            self.onCode = onCode
+        }
+
+        func metadataOutput(
+            _ output: AVCaptureMetadataOutput,
+            didOutput metadataObjects: [AVMetadataObject],
+            from connection: AVCaptureConnection
+        ) {
+            guard !didEmit,
+                  let object = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+                  object.type == .qr,
+                  let value = object.stringValue else {
+                return
+            }
+
+            didEmit = true
+            DispatchQueue.main.async { [onCode] in
+                onCode(value)
+            }
+        }
+    }
+
+    final class ScannerViewController: UIViewController {
+        weak var coordinator: Coordinator?
+
+        private let session = AVCaptureSession()
+        private var previewLayer: AVCaptureVideoPreviewLayer?
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            view.backgroundColor = .black
+            requestAccessAndConfigure()
+        }
+
+        override func viewDidLayoutSubviews() {
+            super.viewDidLayoutSubviews()
+            previewLayer?.frame = view.bounds
+        }
+
+        override func viewWillDisappear(_ animated: Bool) {
+            super.viewWillDisappear(animated)
+            stopSession()
+        }
+
+        private func requestAccessAndConfigure() {
+            switch AVCaptureDevice.authorizationStatus(for: .video) {
+            case .authorized:
+                configureSession()
+            case .notDetermined:
+                AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                    guard granted else {
+                        return
+                    }
+                    DispatchQueue.main.async {
+                        self?.configureSession()
+                    }
+                }
+            default:
+                break
+            }
+        }
+
+        private func configureSession() {
+            guard previewLayer == nil,
+                  let device = AVCaptureDevice.default(for: .video),
+                  let input = try? AVCaptureDeviceInput(device: device),
+                  session.canAddInput(input) else {
+                return
+            }
+            session.addInput(input)
+
+            let output = AVCaptureMetadataOutput()
+            guard session.canAddOutput(output) else {
+                return
+            }
+            session.addOutput(output)
+            output.setMetadataObjectsDelegate(coordinator, queue: .main)
+            output.metadataObjectTypes = [.qr]
+
+            let layer = AVCaptureVideoPreviewLayer(session: session)
+            layer.videoGravity = .resizeAspectFill
+            layer.frame = view.bounds
+            view.layer.addSublayer(layer)
+            previewLayer = layer
+
+            startSession()
+        }
+
+        private func startSession() {
+            guard !session.isRunning else {
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.session.startRunning()
+            }
+        }
+
+        private func stopSession() {
+            guard session.isRunning else {
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.session.stopRunning()
+            }
+        }
+    }
 }

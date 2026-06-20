@@ -6,6 +6,8 @@
 //
 
 import SwiftUI
+import AppKit
+import CoreImage.CIFilterBuiltins
 
 /// A view that implements the `General` settings page
 struct GeneralSettingsView: View {
@@ -22,6 +24,8 @@ struct GeneralSettingsView: View {
     @State private var openInCodeEdit: Bool = true
     @State private var remoteAccessPasscode: String = TerminalRemoteBridge.currentPasscode()
     @State private var remoteAccessStatus: String = ""
+    @State private var pairingImage: NSImage?
+    @State private var pairingSummary: String = ""
 
     init() {
         guard let defaults = UserDefaults.init(
@@ -63,6 +67,7 @@ struct GeneralSettingsView: View {
             Section {
                 openInCodeEditToggle
                 remoteAccessPasscodeField
+                remoteAccessQRCode
                 shellCommand
                 dialogWarnings
 
@@ -262,12 +267,14 @@ private extension GeneralSettingsView {
                         TerminalRemoteBridge.updatePasscode(remoteAccessPasscode)
                         remoteAccessPasscode = TerminalRemoteBridge.currentPasscode()
                         remoteAccessStatus = "Saved"
+                        refreshPairing()
                     }
                     .buttonStyle(.bordered)
 
                     Button("Generate") {
                         remoteAccessPasscode = TerminalRemoteBridge.generateAndStorePasscode()
                         remoteAccessStatus = "Saved"
+                        refreshPairing()
                     }
                     .buttonStyle(.bordered)
                 }
@@ -279,6 +286,74 @@ private extension GeneralSettingsView {
                 }
             }
         }
+    }
+
+    var remoteAccessQRCode: some View {
+        LabeledContent("iPhone Pairing QR") {
+            VStack(alignment: .leading, spacing: 6) {
+                if let pairingImage {
+                    Image(nsImage: pairingImage)
+                        .interpolation(.none)
+                        .resizable()
+                        .frame(width: 132, height: 132)
+                        .padding(6)
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+
+                Text(pairingSummary.isEmpty
+                     ? "Scan with the CodeEdit Remote app to fill in the address and passcode."
+                     : "Address \(pairingSummary) — scan with CodeEdit Remote to connect.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: textEditorWidth, alignment: .leading)
+
+                Button("Refresh") {
+                    refreshPairing()
+                }
+                .buttonStyle(.bordered)
+            }
+            .onAppear {
+                refreshPairing()
+            }
+        }
+    }
+
+    private func refreshPairing() {
+        guard let info = TerminalRemoteBridge.shared.pairingInfo() else {
+            pairingImage = nil
+            pairingSummary = ""
+            return
+        }
+
+        pairingImage = Self.qrImage(from: info.pairingURLString)
+        pairingSummary = "\(info.host):\(info.port)"
+    }
+
+    private static func qrImage(from string: String) -> NSImage? {
+        guard !string.isEmpty else {
+            return nil
+        }
+
+        let context = CIContext()
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(string.utf8)
+        filter.correctionLevel = "M"
+
+        guard let outputImage = filter.outputImage else {
+            return nil
+        }
+
+        let scaledImage = outputImage.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
+        guard let cgImage = context.createCGImage(scaledImage, from: scaledImage.extent) else {
+            return nil
+        }
+
+        return NSImage(
+            cgImage: cgImage,
+            size: NSSize(width: scaledImage.extent.width, height: scaledImage.extent.height)
+        )
     }
 
     func installShellCommand() {

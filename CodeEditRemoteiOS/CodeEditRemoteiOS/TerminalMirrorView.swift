@@ -8,9 +8,19 @@
 import SwiftUI
 import UIKit
 
+/// A styled run of characters within a mirrored terminal row. Colors are packed `0xRRGGBB`
+/// (`nil` = terminal default); `style` is an `OR` of `TerminalRemoteProtocol.SpanStyle` bits.
+struct TerminalMirrorSegment: Equatable {
+    let text: String
+    let foreground: Int?
+    let background: Int?
+    let style: Int
+}
+
 struct TerminalMirrorRow: Identifiable, Equatable {
     let id: Int
     let text: String
+    let segments: [TerminalMirrorSegment]
 }
 
 struct TerminalMirrorSnapshot: Equatable {
@@ -33,10 +43,33 @@ struct TerminalMirrorSnapshot: Equatable {
     }
 }
 
+/// Fixed dark-terminal palette so the mirror reads like a real terminal regardless of the iPhone's
+/// light/dark appearance. The default colors match `TerminalRemoteProtocol`'s shared constants.
+enum TerminalPalette {
+    static let background = Color(packedRGB: TerminalRemoteProtocol.defaultBackgroundRGB)
+    static let defaultForeground = Color(packedRGB: TerminalRemoteProtocol.defaultForegroundRGB)
+}
+
+extension Color {
+    init(packedRGB: Int) {
+        self.init(
+            .sRGB,
+            red: Double((packedRGB >> 16) & 0xFF) / 255.0,
+            green: Double((packedRGB >> 8) & 0xFF) / 255.0,
+            blue: Double(packedRGB & 0xFF) / 255.0
+        )
+    }
+}
+
 struct TerminalMirrorBuffer {
+    private struct RowContent: Equatable {
+        let text: String
+        let segments: [TerminalMirrorSegment]
+    }
+
     private let maxMainRows = 5_000
-    private var mainRows: [Int: String] = [:]
-    private var alternateRows: [Int: String] = [:]
+    private var mainRows: [Int: RowContent] = [:]
+    private var alternateRows: [Int: RowContent] = [:]
     private var lastSequence = 0
     private var screenMode = TerminalRemoteProtocol.ScreenMode.main
     private var columns = 80
@@ -82,7 +115,7 @@ struct TerminalMirrorBuffer {
         lastSequence = output.sequence
 
         for row in output.rows where row.row >= 0 {
-            mainRows[row.row] = row.text
+            mainRows[row.row] = Self.rowContent(from: row)
         }
 
         trimMainRowsIfNeeded()
@@ -97,7 +130,7 @@ struct TerminalMirrorBuffer {
         lastSequence = output.sequence
 
         for row in output.rows where row.row >= 0 && row.row < terminalRows {
-            alternateRows[row.row] = row.text
+            alternateRows[row.row] = Self.rowContent(from: row)
         }
     }
 
@@ -125,17 +158,46 @@ struct TerminalMirrorBuffer {
     private func renderedRows() -> [TerminalMirrorRow] {
         switch screenMode {
         case .main:
-            return mainRows.keys.sorted().map {
-                TerminalMirrorRow(id: $0, text: mainRows[$0] ?? "")
+            return mainRows.keys.sorted().map { key in
+                let content = mainRows[key]
+                return TerminalMirrorRow(
+                    id: key,
+                    text: content?.text ?? "",
+                    segments: content?.segments ?? []
+                )
             }
         case .alternate:
             guard terminalRows > 0 else {
                 return []
             }
-            return (0..<terminalRows).map {
-                TerminalMirrorRow(id: $0, text: alternateRows[$0] ?? "")
+            return (0..<terminalRows).map { key in
+                let content = alternateRows[key]
+                return TerminalMirrorRow(
+                    id: key,
+                    text: content?.text ?? "",
+                    segments: content?.segments ?? []
+                )
             }
         }
+    }
+
+    private static func rowContent(from row: TerminalRemoteProtocol.ProjectedRow) -> RowContent {
+        guard let spans = row.spans, !spans.isEmpty else {
+            return RowContent(
+                text: row.text,
+                segments: [TerminalMirrorSegment(text: row.text, foreground: nil, background: nil, style: 0)]
+            )
+        }
+
+        let segments = spans.map { span in
+            TerminalMirrorSegment(
+                text: span.text,
+                foreground: span.foreground,
+                background: span.background,
+                style: span.style ?? 0
+            )
+        }
+        return RowContent(text: row.text, segments: segments)
     }
 }
 
@@ -148,12 +210,14 @@ struct TerminalMirrorView: View {
     private let bottomID = "terminal-mirror-bottom"
     private let characterWidth: CGFloat = 6.9
     private let lineHeight: CGFloat = 14.5
+    private let fontSize: CGFloat = 11
 
     var body: some View {
         VStack(spacing: 0) {
             mirrorHeader
             Divider()
             mirrorGrid
+                .environment(\.colorScheme, .dark)
         }
         .background(Color(uiColor: .systemBackground))
     }
@@ -202,9 +266,8 @@ struct TerminalMirrorView: View {
                             .frame(minWidth: 320, maxWidth: .infinity, minHeight: 180)
                     } else {
                         ForEach(snapshot.rows) { row in
-                            Text(row.text.isEmpty ? " " : row.text)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(Color(uiColor: .label))
+                            Text(attributedRow(row))
+                                .font(.system(size: fontSize, design: .monospaced))
                                 .lineLimit(1)
                                 .fixedSize(horizontal: true, vertical: false)
                                 .id(row.id)
@@ -218,7 +281,7 @@ struct TerminalMirrorView: View {
                 .frame(minWidth: gridWidth, minHeight: gridHeight, alignment: .topLeading)
                 .padding(6)
             }
-            .background(Color(uiColor: .systemBackground))
+            .background(TerminalPalette.background)
             .onAppear {
                 scheduleScrollToBottom(proxy, delay: 0)
             }
@@ -230,6 +293,57 @@ struct TerminalMirrorView: View {
                 pendingScrollWorkItem = nil
             }
         }
+    }
+
+    /// Builds a styled `AttributedString` for a row. Runs carry their own font/colors, so the whole
+    /// row renders as a single `Text` view, keeping the `LazyVStack` cheap and smooth.
+    private func attributedRow(_ row: TerminalMirrorRow) -> AttributedString {
+        var result = AttributedString()
+
+        for segment in row.segments where !segment.text.isEmpty {
+            var piece = AttributedString(segment.text)
+            piece.mergeAttributes(container(for: segment))
+            result.append(piece)
+        }
+
+        if result.characters.isEmpty {
+            var blank = AttributedString(" ")
+            blank.font = .system(size: fontSize, design: .monospaced)
+            blank.foregroundColor = TerminalPalette.defaultForeground
+            return blank
+        }
+
+        return result
+    }
+
+    private func container(for segment: TerminalMirrorSegment) -> AttributeContainer {
+        var container = AttributeContainer()
+
+        var font = Font.system(size: fontSize, design: .monospaced)
+        if segment.style & TerminalRemoteProtocol.SpanStyle.bold != 0 {
+            font = font.weight(.bold)
+        }
+        if segment.style & TerminalRemoteProtocol.SpanStyle.italic != 0 {
+            font = font.italic()
+        }
+        container.font = font
+
+        let isDim = segment.style & TerminalRemoteProtocol.SpanStyle.dim != 0
+        let foreground = segment.foreground.map(Color.init(packedRGB:)) ?? TerminalPalette.defaultForeground
+        container.foregroundColor = isDim ? foreground.opacity(0.6) : foreground
+
+        if let background = segment.background {
+            container.backgroundColor = Color(packedRGB: background)
+        }
+
+        if segment.style & TerminalRemoteProtocol.SpanStyle.underline != 0 {
+            container.underlineStyle = .single
+        }
+        if segment.style & TerminalRemoteProtocol.SpanStyle.strikethrough != 0 {
+            container.strikethroughStyle = .single
+        }
+
+        return container
     }
 
     private var subtitle: String {

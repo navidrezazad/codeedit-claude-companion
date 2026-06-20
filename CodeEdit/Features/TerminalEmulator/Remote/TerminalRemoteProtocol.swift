@@ -11,6 +11,20 @@ enum TerminalRemoteProtocol {
     static let version = 1
     static let serviceType = "_codeeditv2-term._tcp"
 
+    /// Default terminal foreground/background colors (packed 0xRRGGBB) shared by both sides so the
+    /// iPhone renders the same dark-terminal look the Mac assumes when resolving `inverse` styling.
+    static let defaultForegroundRGB = 0x00E5_E5E5
+    static let defaultBackgroundRGB = 0x0019_1919
+
+    /// Bit positions for `ProjectedSpan.style`, shared by the Mac projector and the iOS renderer.
+    enum SpanStyle {
+        static let bold = 1 << 0
+        static let italic = 1 << 1
+        static let underline = 1 << 2
+        static let strikethrough = 1 << 3
+        static let dim = 1 << 4
+    }
+
     enum ClientMessageType: String, Codable {
         case authenticate
         case list
@@ -160,10 +174,38 @@ enum TerminalRemoteProtocol {
     struct ProjectedRow: Codable, Equatable {
         let row: Int
         let text: String
+        /// Styled runs for this row. `nil` means the whole row uses the default color/style (the
+        /// common case), in which case the renderer falls back to `text` and no extra bytes are sent.
+        let spans: [ProjectedSpan]?
 
-        init(row: Int, text: String) {
+        init(row: Int, text: String, spans: [ProjectedSpan]? = nil) {
             self.row = row
             self.text = text
+            self.spans = spans
+        }
+    }
+
+    /// A run of equally-styled characters within a `ProjectedRow`. Colors are packed `0xRRGGBB`
+    /// integers (`nil` = terminal default); `style` is an `OR` of `SpanStyle` bits (`nil` = none).
+    /// Keys are intentionally terse to keep the streamed JSON small.
+    struct ProjectedSpan: Codable, Equatable {
+        let text: String
+        let foreground: Int?
+        let background: Int?
+        let style: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case text = "t"
+            case foreground = "f"
+            case background = "b"
+            case style = "s"
+        }
+
+        init(text: String, foreground: Int? = nil, background: Int? = nil, style: Int? = nil) {
+            self.text = text
+            self.foreground = foreground
+            self.background = background
+            self.style = style
         }
     }
 

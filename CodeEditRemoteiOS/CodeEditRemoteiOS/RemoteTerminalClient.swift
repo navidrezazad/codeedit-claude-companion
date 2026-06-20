@@ -23,6 +23,7 @@ private enum DefaultsKey {
     static let globalPort = "CodeEditRemote.globalPort"
 }
 
+// swiftlint:disable:next type_body_length
 final class RemoteTerminalClient: ObservableObject {
     struct DiscoveredHost: Identifiable, Equatable {
         let id: String
@@ -92,6 +93,7 @@ final class RemoteTerminalClient: ObservableObject {
     private var projectedOutputFlushWorkItem: DispatchWorkItem?
     private var shouldRememberEndpointFromHello = false
     private var activeMarkdownStreamID: UUID?
+    private var connectionInFlight = false
 
     var selectedSession: TerminalRemoteProtocol.Session? { sessions.first { $0.id == selectedSessionID } }
 
@@ -170,6 +172,7 @@ final class RemoteTerminalClient: ObservableObject {
     private func connect(to endpoint: NWEndpoint, displayName: String, rememberEndpointFromHello: Bool) {
         disconnect()
         shouldRememberEndpointFromHello = rememberEndpointFromHello
+        connectionInFlight = true
         statusMessage = "Connecting to \(displayName)"
 
         let connection = NWConnection(to: endpoint, using: .tcp)
@@ -183,6 +186,7 @@ final class RemoteTerminalClient: ObservableObject {
             DispatchQueue.main.async {
                 switch state {
                 case .ready:
+                    self.connectionInFlight = false
                     self.isConnected = true
                     self.statusMessage = "Connected"
                     self.receiveNext()
@@ -190,10 +194,12 @@ final class RemoteTerminalClient: ObservableObject {
                         self.authenticate()
                     }
                 case .failed(let error):
+                    self.connectionInFlight = false
                     self.statusMessage = error.localizedDescription
                     self.isConnected = false
                     self.isAuthenticated = false
                 case .cancelled:
+                    self.connectionInFlight = false
                     self.isConnected = false
                     self.isAuthenticated = false
                 default:
@@ -205,9 +211,71 @@ final class RemoteTerminalClient: ObservableObject {
         connection.start(queue: queue)
     }
 
+    /// Reconnects to the most recently used saved endpoint (local first, then global) when the app
+    /// launches or returns to the foreground. A single attempt; no-op if already connected or busy.
+    func attemptAutoReconnect() {
+        guard !isConnected, !connectionInFlight, !passcode.isEmpty else {
+            return
+        }
+
+        let host = localHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let port = localPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !host.isEmpty, !port.isEmpty {
+            connectLocalDirect()
+            return
+        }
+
+        let globalHostValue = globalHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let globalPortValue = globalPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !globalHostValue.isEmpty, !globalPortValue.isEmpty {
+            connectGlobalDirect()
+        }
+    }
+
+    /// Applies pairing details (from a scanned QR code or deep link) and immediately connects.
+    func applyPairing(host: String, port: String, passcode pairingPasscode: String?) {
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPort = port.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty, !trimmedPort.isEmpty else {
+            statusMessage = "Pairing code missing host or port"
+            return
+        }
+
+        localHost = trimmedHost
+        localPort = trimmedPort
+        if let pairingPasscode, !pairingPasscode.isEmpty {
+            passcode = pairingPasscode
+        }
+        connectLocalDirect()
+    }
+
+    /// Parses a `codeeditv2://pair?host=…&port=…&code=…` URL and connects. Returns `false` if the
+    /// URL is not a recognized pairing link.
+    @discardableResult
+    func handlePairingURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "codeeditv2",
+              url.host?.lowercased() == "pair",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return false
+        }
+
+        let items = components.queryItems ?? []
+        func value(for name: String) -> String? {
+            items.first { $0.name == name }?.value
+        }
+
+        guard let host = value(for: "host"), let port = value(for: "port") else {
+            return false
+        }
+
+        applyPairing(host: host, port: port, passcode: value(for: "code"))
+        return true
+    }
+
     func disconnect() {
         connection?.cancel()
         connection = nil
+        connectionInFlight = false
         receiveBuffer.removeAll()
         sessions.removeAll()
         selectedSessionID = nil
@@ -611,14 +679,15 @@ private extension RemoteTerminalClient {
             return
         }
 
-        var rowsByIndex = Dictionary(uniqueKeysWithValues: pendingProjectedOutput.rows.map { ($0.row, $0.text) })
+        var rowsByIndex = Dictionary(
+            pendingProjectedOutput.rows.map { ($0.row, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
         for row in output.rows {
-            rowsByIndex[row.row] = row.text
+            rowsByIndex[row.row] = row
         }
 
-        let rows = rowsByIndex.keys.sorted().map {
-            TerminalRemoteProtocol.ProjectedRow(row: $0, text: rowsByIndex[$0] ?? "")
-        }
+        let rows = rowsByIndex.keys.sorted().compactMap { rowsByIndex[$0] }
 
         self.pendingProjectedOutput = TerminalRemoteProtocol.ProjectedOutput(
             sequence: output.sequence,

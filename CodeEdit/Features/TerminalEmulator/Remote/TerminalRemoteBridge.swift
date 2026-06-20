@@ -34,6 +34,7 @@ final class TerminalRemoteBridge {
     private let maxMarkdownStreamBytes = 8 * 1024 * 1024
     private let maxEmbeddedImageBytes = 10 * 1024 * 1024
     private var listener: NWListener?
+    private(set) var listeningPort: UInt16 = 0
     private var clients: [UUID: Client] = [:]
     private var publicIPAddress: String?
     private var publicIPAddressFetchInFlight = false
@@ -124,6 +125,7 @@ final class TerminalRemoteBridge {
         switch state {
         case .ready:
             let port = listener?.port?.rawValue ?? 0
+            listeningPort = port
             writeEndpointFile()
             refreshPublicIPAddressIfNeeded { [weak self] _ in
                 self?.writeEndpointFile()
@@ -323,6 +325,58 @@ final class TerminalRemoteBridge {
         let publicAddressText = publicIPAddress.map { ", public address \($0)" } ?? ""
 
         return "CodeEditV2 remote bridge: port \(port), addresses \(addresses)\(publicAddressText)"
+    }
+
+    /// Connection details the iPhone needs to pair, encoded into a scannable `codeeditv2://pair` link.
+    struct RemotePairingInfo {
+        let host: String
+        let port: UInt16
+        let passcode: String
+
+        var pairingURLString: String {
+            var components = URLComponents()
+            components.scheme = "codeeditv2"
+            components.host = "pair"
+            components.queryItems = [
+                URLQueryItem(name: "host", value: host),
+                URLQueryItem(name: "port", value: String(port)),
+                URLQueryItem(name: "code", value: passcode)
+            ]
+            return components.url?.absoluteString ?? ""
+        }
+    }
+
+    /// Best-effort pairing details for the QR shown in Settings. Returns `nil` until the bridge is
+    /// listening and a reachable local address is available.
+    func pairingInfo() -> RemotePairingInfo? {
+        let port = listeningPort
+        guard port != 0 else {
+            return nil
+        }
+
+        let addresses = Self.localIPAddresses()
+        guard let host = Self.preferredPairingAddress(from: addresses) else {
+            return nil
+        }
+
+        return RemotePairingInfo(host: host, port: port, passcode: Self.currentPasscode())
+    }
+
+    private static func preferredPairingAddress(from addresses: [String]) -> String? {
+        addresses.first(where: isPrivateLANAddress) ?? addresses.first
+    }
+
+    private static func isPrivateLANAddress(_ address: String) -> Bool {
+        let octets = address.split(separator: ".").compactMap { Int($0) }
+        guard octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) else {
+            return false
+        }
+
+        if octets[0] == 10 || (octets[0] == 192 && octets[1] == 168) {
+            return true
+        }
+
+        return octets[0] == 172 && (16...31).contains(octets[1])
     }
 
     private func refreshPublicIPAddressIfNeeded(completion: ((String?) -> Void)? = nil) {
@@ -1096,10 +1150,36 @@ private extension TerminalRemoteBridge {
                 screenMode: output.screenMode,
                 columns: output.columns,
                 terminalRows: output.terminalRows,
-                rows: output.rows.map {
-                    TerminalRemoteProtocol.ProjectedRow(row: $0.row, text: $0.text)
+                rows: output.rows.map { row in
+                    TerminalRemoteProtocol.ProjectedRow(
+                        row: row.row,
+                        text: row.text,
+                        spans: remoteSpans(from: row.spans)
+                    )
                 }
             )
+        }
+
+        /// Maps styled spans to the wire type, returning `nil` when the whole row uses default
+        /// colors and no styling so plain terminal output stays as compact as before.
+        private static func remoteSpans(
+            from spans: [TerminalProjectedSpan]
+        ) -> [TerminalRemoteProtocol.ProjectedSpan]? {
+            let hasStyling = spans.contains { span in
+                span.foreground != nil || span.background != nil || span.style != 0
+            }
+            guard hasStyling else {
+                return nil
+            }
+
+            return spans.map { span in
+                TerminalRemoteProtocol.ProjectedSpan(
+                    text: span.text,
+                    foreground: span.foreground,
+                    background: span.background,
+                    style: span.style == 0 ? nil : span.style
+                )
+            }
         }
 
         func detach(from sessionID: UUID) {
