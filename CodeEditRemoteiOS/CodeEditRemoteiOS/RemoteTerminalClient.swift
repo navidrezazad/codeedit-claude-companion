@@ -7,6 +7,7 @@
 
 import Foundation
 import Network
+import UIKit
 
 private enum CommandTranscriptSize {
     static let columns = 140
@@ -21,6 +22,7 @@ private enum DefaultsKey {
     static let localPort = "CodeEditRemote.localPort"
     static let globalHost = "CodeEditRemote.globalHost"
     static let globalPort = "CodeEditRemote.globalPort"
+    static let lastMarkdownDocument = "CodeEditRemote.lastMarkdownDocument"
 }
 
 // swiftlint:disable:next type_body_length
@@ -41,7 +43,13 @@ final class RemoteTerminalClient: ObservableObject {
     @Published var pendingInput = ""
     @Published var currentDirectoryPath: String?
     @Published var files: [TerminalRemoteProtocol.FileItem] = []
-    @Published var markdownDocument: TerminalRemoteProtocol.MarkdownDocument?
+    /// Most recently opened Markdown file, restored on launch and re-persisted whenever it changes so the
+    /// Markdown tab keeps its content across reconnects and app restarts.
+    @Published var markdownDocument = RemoteTerminalClient.loadPersistedMarkdownDocument() {
+        didSet {
+            persistMarkdownDocument(markdownDocument)
+        }
+    }
     @Published var passcode = UserDefaults.standard.string(forKey: DefaultsKey.passcode) ?? "" {
         didSet {
             UserDefaults.standard.set(passcode, forKey: DefaultsKey.passcode)
@@ -94,6 +102,7 @@ final class RemoteTerminalClient: ObservableObject {
     private var shouldRememberEndpointFromHello = false
     private var activeMarkdownStreamID: UUID?
     private var connectionInFlight = false
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     var selectedSession: TerminalRemoteProtocol.Session? { sessions.first { $0.id == selectedSessionID } }
 
@@ -175,7 +184,7 @@ final class RemoteTerminalClient: ObservableObject {
         connectionInFlight = true
         statusMessage = "Connecting to \(displayName)"
 
-        let connection = NWConnection(to: endpoint, using: .tcp)
+        let connection = NWConnection(to: endpoint, using: Self.keepAliveParameters())
         self.connection = connection
 
         connection.stateUpdateHandler = { [weak self] state in
@@ -282,10 +291,42 @@ final class RemoteTerminalClient: ObservableObject {
         resetTerminalPresentation()
         currentDirectoryPath = nil
         files.removeAll()
-        markdownDocument = nil
+        // Intentionally keep `markdownDocument` so the last-opened Markdown is retained across
+        // reconnects and app restarts. It is persisted separately via persistMarkdownDocument(_:).
         isConnected = false
         isAuthenticated = false
         shouldRememberEndpointFromHello = false
+    }
+
+    /// Requests a short background execution window (~30s, the iOS limit for ordinary apps) so the live
+    /// connection survives quick app switches instead of dropping the moment the app is backgrounded.
+    /// Pair with `endBackgroundKeepAlive()` when returning to the foreground.
+    func beginBackgroundKeepAlive() {
+        endBackgroundKeepAlive()
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "RemoteTerminalKeepAlive") { [weak self] in
+            self?.endBackgroundKeepAlive()
+        }
+    }
+
+    func endBackgroundKeepAlive() {
+        guard backgroundTask != .invalid else {
+            return
+        }
+
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
+    }
+
+    /// TCP parameters with keepalive enabled so the OS keeps the socket healthy across idle periods and
+    /// app switches, and detects dropped connections quickly.
+    private static func keepAliveParameters() -> NWParameters {
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveIdle = 10
+        tcpOptions.keepaliveInterval = 5
+        tcpOptions.keepaliveCount = 3
+        tcpOptions.noDelay = true
+        return NWParameters(tls: nil, tcp: tcpOptions)
     }
 
     func authenticate() {
@@ -470,6 +511,36 @@ final class RemoteTerminalClient: ObservableObject {
             statusMessage = message.message ?? "Error"
             markMarkdownStreamErrorIfNeeded(statusMessage)
         }
+    }
+}
+
+private extension RemoteTerminalClient {
+    static let maxPersistedMarkdownByteCount = 4 * 1024 * 1024
+
+    /// Loads the last-opened Markdown document persisted by `persistMarkdownDocument(_:)`, if any.
+    static func loadPersistedMarkdownDocument() -> TerminalRemoteProtocol.MarkdownDocument? {
+        guard let data = UserDefaults.standard.data(forKey: DefaultsKey.lastMarkdownDocument) else {
+            return nil
+        }
+
+        return try? JSONDecoder().decode(TerminalRemoteProtocol.MarkdownDocument.self, from: data)
+    }
+
+    /// Persists the current Markdown document so the Markdown tab can be restored on the next launch.
+    /// Clears the stored copy when there is no document, and skips unusually large files to keep the
+    /// UserDefaults store small.
+    func persistMarkdownDocument(_ document: TerminalRemoteProtocol.MarkdownDocument?) {
+        guard let document else {
+            UserDefaults.standard.removeObject(forKey: DefaultsKey.lastMarkdownDocument)
+            return
+        }
+
+        guard let data = try? JSONEncoder().encode(document),
+              data.count <= Self.maxPersistedMarkdownByteCount else {
+            return
+        }
+
+        UserDefaults.standard.set(data, forKey: DefaultsKey.lastMarkdownDocument)
     }
 }
 

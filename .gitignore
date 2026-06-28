@@ -94,6 +94,7 @@ iOSInjectionProject/
 
 .DS_Store
 .codeedit
+.codeeditv2/
 .claude/
 .idea
 .vscode

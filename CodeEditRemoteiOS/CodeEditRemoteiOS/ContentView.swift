@@ -55,8 +55,14 @@ struct ContentView: View {
             client.attemptAutoReconnect()
         }
         .onChange(of: scenePhase) { _, newPhase in
-            if newPhase == .active {
+            switch newPhase {
+            case .active:
+                client.endBackgroundKeepAlive()
                 client.attemptAutoReconnect()
+            case .background:
+                client.beginBackgroundKeepAlive()
+            default:
+                break
             }
         }
         .onChange(of: client.isAuthenticated) { _, isAuthenticated in
@@ -547,7 +553,11 @@ struct MarkdownWebView: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {
         context.coordinator.scrollsToBottom = scrollsToBottom
-        let needsMath = Self.containsMath(markdown)
+        // Always load KaTeX. Detecting "does this contain math?" separately from the tokenizer that
+        // actually extracts it meant the two could disagree for some delimiters (e.g. inline `$ x$`),
+        // leaving KaTeX unloaded so equations silently fell back to raw text. Loading it unconditionally
+        // keeps math rendering reliable; the assets are already bundled and prewarmed.
+        let needsMath = true
 
         guard context.coordinator.renderedMarkdown != markdown
             || context.coordinator.loadedMathSupport != needsMath
@@ -977,22 +987,6 @@ struct MarkdownWebView: UIViewRepresentable {
         """
     }
 
-    private static func containsMath(_ markdown: String) -> Bool {
-        let containsDelimitedMath = markdown.contains("$$")
-            || markdown.contains("\\[")
-            || markdown.contains("\\(")
-            || markdown.contains("\\begin{")
-
-        if containsDelimitedMath {
-            return true
-        }
-
-        return markdown.range(
-            of: #"(?<!\\)\$[^\s$][^\n$]*?(?<!\\)\$"#,
-            options: .regularExpression
-        ) != nil
-    }
-
     private static func javascriptStringLiteral(_ value: String) -> String {
         guard let data = try? JSONEncoder().encode(value),
               let string = String(data: data, encoding: .utf8) else {
@@ -1012,6 +1006,26 @@ struct MarkdownWebView: UIViewRepresentable {
             if scrollsToBottom {
                 scrollToBottom(in: webView)
             }
+        }
+
+        /// WebKit jettisons the web content process while the Markdown tab is offscreen (e.g. after
+        /// switching to the Files or Terminal tab), which leaves the web view blank. The early-return
+        /// in `updateUIView` would otherwise keep it blank because the coordinator still believes it
+        /// rendered this Markdown. Reload the last rendered document so the tab restores its content.
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            guard let markdown = renderedMarkdown else {
+                return
+            }
+
+            hasLoadedInitialDocument = true
+            webView.loadHTMLString(
+                MarkdownWebView.htmlDocument(
+                    for: markdown,
+                    scrollsToBottom: scrollsToBottom,
+                    loadsMath: loadedMathSupport
+                ),
+                baseURL: nil
+            )
         }
 
         func scrollToBottom(in webView: WKWebView) {
