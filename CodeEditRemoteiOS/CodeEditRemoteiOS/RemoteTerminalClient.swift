@@ -578,10 +578,7 @@ extension RemoteTerminalClient {
             sessionID: selectedSessionID,
             path: "",
             name: "Markdown Stream",
-            markdown: localMarkdownStreamMarkdown(
-                status: "Starting",
-                detail: "Waiting for the Mac bridge to create the automatic stream file."
-            ),
+            markdown: "",
             isActive: true
         )
         scheduleMarkdownStreamHandshakeTimeout(streamID: streamID)
@@ -656,10 +653,7 @@ extension RemoteTerminalClient {
                     sessionID: selectedSessionID,
                     path: "",
                     name: "Markdown Stream",
-                    markdown: self.localMarkdownStreamMarkdown(
-                        status: "Retrying",
-                        detail: "The first stream request was not acknowledged. Retrying with the Mac bridge."
-                    ),
+                    markdown: "",
                     isActive: true
                 )
                 self.sendMarkdownStreamStart(streamID: streamID, sessionID: selectedSessionID)
@@ -673,16 +667,7 @@ extension RemoteTerminalClient {
                 sessionID: self.selectedSessionID ?? UUID(),
                 path: "",
                 name: "Markdown Stream",
-                markdown: self.localMarkdownStreamMarkdown(
-                    status: "Waiting for Mac stream",
-                    detail: """
-                    The automatic stream was started, but the iPhone has not received a stream file path
-                    from the Mac yet.
-
-                    Check that the Mac CodeEditV2 app was rebuilt and restarted after the MD Stream update,
-                    then reconnect the iPhone.
-                    """
-                ),
+                markdown: "",
                 isActive: false
             )
             self.markdownStreamIsActive = false
@@ -701,22 +686,11 @@ extension RemoteTerminalClient {
             sessionID: document.sessionID,
             path: document.path,
             name: document.name,
-            markdown: localMarkdownStreamMarkdown(status: "Error", detail: message),
+            markdown: "",
             isActive: false
         )
         markdownStreamIsActive = false
         activeMarkdownStreamID = nil
-    }
-
-    private func localMarkdownStreamMarkdown(status: String, detail: String) -> String {
-        """
-        # Markdown Stream Agent
-
-        **Status:** \(status)
-
-        \(detail)
-
-        """
     }
 }
 

@@ -1306,11 +1306,14 @@ private extension TerminalRemoteBridge {
             private var needsFollowUpRun = false
             private var claudeProcess: Process?
             private var isCancelled = false
+            private var autoUpdateWorkItem: DispatchWorkItem?
 
             private let maxTerminalDeltaBytes = 1_000_000
             private let maxTerminalDeltaCharacters = 240_000
             private let maxTerminalPromptCharacters = 4_000
             private let maxStatusDetailCharacters = 4_000
+            /// Idle window after the last terminal output chunk before the Markdown update runs on its own.
+            private let autoUpdateIdleDelay: DispatchTimeInterval = .milliseconds(2_000)
 
             init(
                 streamID: UUID,
@@ -1379,6 +1382,7 @@ private extension TerminalRemoteBridge {
                 isCancelled = true
                 timer?.cancel()
                 timer = nil
+                cancelAutomaticUpdate()
                 claudeProcess?.terminate()
                 claudeProcess = nil
 
@@ -1527,7 +1531,8 @@ private extension TerminalRemoteBridge {
                 terminalOutputRowOrder.removeAll(keepingCapacity: true)
                 terminalOutputCharacterCount = 0
                 needsFollowUpRun = false
-                updateStatusLine("Waiting for manual Markdown update")
+                cancelAutomaticUpdate()
+                updateStatusLine("Waiting for command output")
             }
 
             private func appendRawOutput(
@@ -1550,8 +1555,9 @@ private extension TerminalRemoteBridge {
                 if !hasMeaningfulRawCapture,
                    Self.hasMeaningfulTerminalText(in: Self.plainTerminalText(from: data)) {
                     hasMeaningfulRawCapture = true
-                    updateStatusLine("Ready for manual Markdown update")
+                    updateStatusLine("Capturing terminal output")
                 }
+                scheduleAutomaticUpdate()
             }
 
             private func appendTerminalOutput(_ projection: TerminalProjectedOutput) {
@@ -1570,8 +1576,9 @@ private extension TerminalRemoteBridge {
                 }
                 trimTerminalOutputRowsIfNeeded()
                 if wasEmpty, terminalOutputCharacterCount > 0 {
-                    updateStatusLine("Ready for manual Markdown update")
+                    updateStatusLine("Capturing terminal output")
                 }
+                scheduleAutomaticUpdate()
             }
 
             private func terminalOutputText() -> String {
@@ -1597,6 +1604,38 @@ private extension TerminalRemoteBridge {
                 return terminalOutputText()
             }
 
+            /// Runs the Markdown update automatically once terminal output for the current command has been
+            /// idle for `autoUpdateIdleDelay` — i.e. the command appears to have finished — so terminal
+            /// activity is reflected in the stream without a manual press. The manual trigger still works.
+            private func scheduleAutomaticUpdate() {
+                guard !isCancelled, currentTerminalPrompt != nil, let queue = client?.bridge?.queue else {
+                    return
+                }
+
+                autoUpdateWorkItem?.cancel()
+                let workItem = DispatchWorkItem { [weak self] in
+                    guard let self else {
+                        return
+                    }
+                    self.autoUpdateWorkItem = nil
+                    guard !self.isCancelled, self.currentTerminalPrompt != nil else {
+                        return
+                    }
+                    guard self.hasMeaningfulRawCapture || self.terminalOutputCharacterCount > 0 else {
+                        return
+                    }
+                    self.startClaudeUpdateIfPossible()
+                }
+
+                autoUpdateWorkItem = workItem
+                queue.asyncAfter(deadline: .now() + autoUpdateIdleDelay, execute: workItem)
+            }
+
+            private func cancelAutomaticUpdate() {
+                autoUpdateWorkItem?.cancel()
+                autoUpdateWorkItem = nil
+            }
+
             private func startClaudeUpdateIfPossible() {
                 guard !isCancelled else {
                     return
@@ -1612,6 +1651,7 @@ private extension TerminalRemoteBridge {
                 }
 
                 let terminalDelta = currentTerminalDelta()
+                cancelAutomaticUpdate()
                 terminalRawCapture.removeAll(keepingCapacity: true)
                 hasMeaningfulRawCapture = false
                 terminalOutputRows.removeAll(keepingCapacity: true)
@@ -1929,7 +1969,8 @@ private extension TerminalRemoteBridge {
                 }
 
                 needsFollowUpRun = false
-                updateStatusLine("Ready for manual Markdown update")
+                updateStatusLine("Capturing terminal output")
+                scheduleAutomaticUpdate()
             }
 
             private func claudePrompt(
