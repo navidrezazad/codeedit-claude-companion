@@ -87,6 +87,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var rawOutputSubscribers: [UUID: RawOutputHandler] = [:]
     private var projectedRows: [Int: ProjectedRowContent] = [:]
     private var projectedOutputSequence = 0
+    private var lastProjectedColumns = 0
+    private var lastProjectedRows = 0
     private var screenMode: TerminalRemoteProtocol.ScreenMode = .main
     private var terminalControlTail = ""
     private let maxProjectedRows = 5_000
@@ -211,6 +213,21 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func renderedOutputProjection() -> TerminalProjectedOutput? {
         let terminal = view.getTerminal()
+
+        // A window/pane resize reflows the whole SwiftTerm buffer, which renumbers the scroll-invariant
+        // row indices the mirror keys on. The wire protocol overwrites rows by index and has no
+        // "row removed" signal, so without this the iOS mirror keeps stale rows at the old indices and
+        // duplicates content. On a dimension change, resync: drop the change-detection cache, restart the
+        // sequence (so the mirror clears via its sequence-regression path), and re-mark the full screen so
+        // the current contents are re-sent under their new indices.
+        if terminal.cols != lastProjectedColumns || terminal.rows != lastProjectedRows {
+            lastProjectedColumns = terminal.cols
+            lastProjectedRows = terminal.rows
+            projectedRows.removeAll(keepingCapacity: true)
+            projectedOutputSequence = 0
+            terminal.refresh(startRow: 0, endRow: max(0, terminal.rows - 1))
+        }
+
         guard let range = terminal.getScrollInvariantUpdateRange() else {
             return nil
         }
