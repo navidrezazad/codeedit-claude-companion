@@ -290,13 +290,9 @@ final class Editor: ObservableObject, Identifiable {
     ///   - asTemporary: indicates whether the tab should be opened as a temporary tab or a permanent tab.
     func openTab(file: CEWorkspaceFile, asTemporary: Bool) {
         if file.url.isMarkdownDocument {
-            let source = markdownTab(for: file, presentation: .source)
+            // Markdown files open directly in the rendered preview; the raw source is available on
+            // demand via Editor ▸ Markdown ▸ Show Source.
             let preview = markdownTab(for: file, presentation: .markdownPreview)
-
-            if !tabs.contains(source) {
-                openTab(tab: source)
-            }
-
             openTab(tab: preview)
             return
         }
@@ -370,19 +366,10 @@ final class Editor: ObservableObject, Identifiable {
     ///   - fromHistory: Indicates whether the tab has been opened from going back in history.
     func openTab(file: CEWorkspaceFile, at index: Int? = nil, fromHistory: Bool = false) {
         if file.url.isMarkdownDocument {
-            let source = markdownTab(for: file, presentation: .source)
+            // Markdown files open directly in the rendered preview; the raw source is available on
+            // demand via Editor ▸ Markdown ▸ Show Source.
             let preview = markdownTab(for: file, presentation: .markdownPreview)
-            let sourceExists = tabs.contains(source)
-
-            if !sourceExists {
-                openTab(tab: source, at: index, fromHistory: fromHistory)
-            }
-
-            openTab(
-                tab: preview,
-                at: index.map { $0 + (sourceExists ? 0 : 1) },
-                fromHistory: fromHistory
-            )
+            openTab(tab: preview, at: index, fromHistory: fromHistory)
             return
         }
 

@@ -29,6 +29,8 @@ struct EditorAreaFileView: View {
                     codeFile: codeFile,
                     isActive: editor.selectedTab == editorInstance
                 )
+                .padding(.top, edgeInsets.top - 1.74)
+                .padding(.bottom, StatusBarView.height + 1.26)
             } else {
                 CodeFileView(
                     editorInstance: editorInstance,
