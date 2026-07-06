@@ -56,7 +56,8 @@ CodeEditRemoteiOS/Shared/         protocol shared with the Mac bridge
 CodeEditRemoteiOS/CodeEditRemoteiOS/MarkdownRenderer/
                                   local Markdown, sanitizer, and KaTeX assets
 BUILD.md                          local build/install notes
-LICENSE.md                        upstream MIT license
+LICENSE.md                        MIT license
+NOTICE.md                         third-party attribution (CodeEdit, SwiftTerm, KaTeX, marked, DOMPurify)
 ```
 
 ## Build
@@ -92,11 +93,20 @@ The prototype currently focuses on two iOS surfaces:
 
 The project is useful as a local productivity experiment and as a demonstration of native Apple-platform engineering across macOS, iOS, networking, terminal streaming, and AI-assisted documentation.
 
+## License
+
+Released under the MIT License; see `LICENSE.md`. This project is a fork of
+CodeEdit and bundles additional third-party open-source components — see
+`NOTICE.md` for complete attribution and their licenses.
+
 ## Attribution
 
-This project is built on top of the open-source CodeEdit project.
+This project is built on top of the open-source CodeEdit project and other
+third-party software:
 
-- Upstream project: https://github.com/CodeEditApp/CodeEdit
-- Upstream license: MIT, preserved in `LICENSE.md`
+- CodeEdit — https://github.com/CodeEditApp/CodeEdit (MIT)
+- SwiftTerm — https://github.com/migueldeicaza/SwiftTerm (MIT)
+- KaTeX, marked, DOMPurify — bundled in the iOS Markdown renderer (MIT / Apache-2.0)
 
+Upstream licenses are preserved in `LICENSE.md` and detailed in `NOTICE.md`.
 This repository is not affiliated with or endorsed by the CodeEdit project.
