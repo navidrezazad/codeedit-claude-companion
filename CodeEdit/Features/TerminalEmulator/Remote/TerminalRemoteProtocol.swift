@@ -38,6 +38,8 @@ enum TerminalRemoteProtocol {
         case stopMarkdownStream
         case triggerMarkdownStreamUpdate
         case rewriteMarkdownStream
+        case createTmuxSession
+        case killTmuxSession
     }
 
     enum ServerMessageType: String, Codable {
@@ -63,6 +65,7 @@ enum TerminalRemoteProtocol {
         let streamID: UUID?
         let columns: Int?
         let rows: Int?
+        let sessionName: String?
 
         init(
             type: ClientMessageType,
@@ -74,7 +77,8 @@ enum TerminalRemoteProtocol {
             prompt: String? = nil,
             streamID: UUID? = nil,
             columns: Int? = nil,
-            rows: Int? = nil
+            rows: Int? = nil,
+            sessionName: String? = nil
         ) {
             self.type = type
             self.token = token
@@ -86,6 +90,7 @@ enum TerminalRemoteProtocol {
             self.streamID = streamID
             self.columns = columns
             self.rows = rows
+            self.sessionName = sessionName
         }
     }
 
@@ -217,6 +222,12 @@ enum TerminalRemoteProtocol {
         let isRunning: Bool
         let columns: Int?
         let rows: Int?
+        /// The tmux session name backing this session (nil for a plain-shell fallback terminal).
+        let tmuxName: String?
+        /// Number of tmux windows in the session, when tmux-backed.
+        let windowCount: Int?
+        /// Whether a tmux client is currently attached to the session.
+        let attached: Bool?
 
         init(
             id: UUID,
@@ -225,7 +236,10 @@ enum TerminalRemoteProtocol {
             shell: String?,
             isRunning: Bool,
             columns: Int? = nil,
-            rows: Int? = nil
+            rows: Int? = nil,
+            tmuxName: String? = nil,
+            windowCount: Int? = nil,
+            attached: Bool? = nil
         ) {
             self.id = id
             self.title = title
@@ -234,6 +248,9 @@ enum TerminalRemoteProtocol {
             self.isRunning = isRunning
             self.columns = columns
             self.rows = rows
+            self.tmuxName = tmuxName
+            self.windowCount = windowCount
+            self.attached = attached
         }
     }
 

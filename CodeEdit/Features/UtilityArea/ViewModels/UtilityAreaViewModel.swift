@@ -13,6 +13,7 @@ import SwiftUI
 /// A model class to host and manage data for the Utility area.
 class UtilityAreaViewModel: ObservableObject {
     private var restorationSaveWorkItem: DispatchWorkItem?
+    private var isReconcilingTmux = false
 
     private struct TerminalRestorationState: Codable {
         let terminals: [TerminalRestorationItem]
@@ -143,10 +144,25 @@ class UtilityAreaViewModel: ObservableObject {
     /// The new selection is either the same selection minus the ids removed, or if that's empty the last terminal.
     /// - Parameter ids: A set of all terminal ids to remove.
     func removeTerminals(_ ids: Set<UUID>) {
+        var namesToKill: [String] = []
         for (idx, terminal) in terminals.enumerated().reversed()
         where ids.contains(terminal.id) {
+            if let tmuxName = TerminalSessionManager.shared.tmuxSessionName(for: terminal.id) {
+                namesToKill.append(tmuxName)
+            }
             TerminalSessionManager.shared.terminateAndRemoveSession(terminal.id)
             terminals.remove(at: idx)
+        }
+
+        // Kill the backing tmux sessions off the main thread (the tmux CLI spawns a process) so deleting
+        // a terminal doesn't stutter the UI. App *quit* uses `terminateAndRemoveSession` alone (SIGHUP),
+        // which only detaches, so undeleted sessions persist for resume on relaunch.
+        if !namesToKill.isEmpty {
+            DispatchQueue.global(qos: .userInitiated).async {
+                for name in namesToKill {
+                    _ = TmuxService.shared.killSession(name: name)
+                }
+            }
         }
 
         var newSelection = selectedTerminals.subtracting(ids)
@@ -245,6 +261,118 @@ class UtilityAreaViewModel: ObservableObject {
         registerTerminal(terminal)
 
         selectedTerminals = [id]
+    }
+
+    /// Whether tmux is installed (the session store). When false the sidebar falls back to plain shells.
+    var isTmuxAvailable: Bool {
+        TmuxService.shared.isAvailable
+    }
+
+    /// The live tmux sessions (used to populate the "attach session" list in the sidebar).
+    func liveTmuxSessions() -> [TmuxSessionInfo] {
+        TmuxService.shared.listSessions()
+    }
+
+    /// Opens (attaches) a terminal for a named tmux session, creating the tmux session if it doesn't
+    /// exist yet (`tmux new -A -s NAME`). Selects an existing tab if the session is already open.
+    func addTmuxSession(name: String, rootURL: URL?) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return
+        }
+
+        if let existing = terminals.first(where: {
+            TerminalSessionManager.shared.tmuxSessionName(for: $0.id) == trimmed
+        }) {
+            selectedTerminals = [existing.id]
+            return
+        }
+
+        let id = UUID()
+        let terminal = UtilityAreaTerminal(
+            id: id,
+            url: rootURL ?? URL(filePath: "~/"),
+            title: trimmed,
+            shell: nil
+        )
+        terminals.append(terminal)
+        TerminalSessionManager.shared.registerTerminal(
+            id: id,
+            title: trimmed,
+            currentDirectory: rootURL,
+            shell: nil,
+            tmuxSessionName: trimmed
+        )
+        selectedTerminals = [id]
+    }
+
+    /// Kills a tmux session and closes any terminal tab backed by it.
+    func killTmuxSession(name: String) {
+        let ids = terminals
+            .filter { TerminalSessionManager.shared.tmuxSessionName(for: $0.id) == name }
+            .map(\.id)
+        if ids.isEmpty {
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = TmuxService.shared.killSession(name: name)
+            }
+        } else {
+            removeTerminals(Set(ids))
+        }
+    }
+
+    /// Surfaces every live tmux session as a sidebar row so the sidebar acts as a session list:
+    /// clicking a row selects it, which attaches that tmux session in the terminal view. Rows are keyed
+    /// by the session's stable id so the same tmux session is never duplicated. This only *adds* rows —
+    /// removal happens through explicit kill/close so freshly-created (not-yet-spawned) rows aren't
+    /// yanked out from under the user.
+    ///
+    /// The `tmux list-sessions` call runs off the main thread (it spawns a process) so it never stutters
+    /// the UI; the small diff is applied back on the main thread.
+    func reconcileTmuxSessions(rootURL: URL?) {
+        guard TmuxService.shared.isAvailable, !isReconcilingTmux else {
+            return
+        }
+        isReconcilingTmux = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let sessions = TmuxService.shared.listSessions()
+            if !sessions.isEmpty {
+                TmuxService.shared.enableMouseModeOnce()
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isReconcilingTmux = false
+                self.applyTmuxSessions(sessions, rootURL: rootURL)
+            }
+        }
+    }
+
+    private func applyTmuxSessions(_ sessions: [TmuxSessionInfo], rootURL: URL?) {
+        let existingNames = Set(terminals.compactMap { TerminalSessionManager.shared.tmuxSessionName(for: $0.id) })
+
+        for session in sessions where !existingNames.contains(session.name) {
+            let id = TmuxService.shared.id(forSessionNamed: session.name)
+            guard !terminals.contains(where: { $0.id == id }) else {
+                continue
+            }
+            let terminal = UtilityAreaTerminal(
+                id: id,
+                url: rootURL ?? URL(filePath: "~/"),
+                title: session.name,
+                shell: nil
+            )
+            terminals.append(terminal)
+            TerminalSessionManager.shared.registerTerminal(
+                id: id,
+                title: session.name,
+                currentDirectory: rootURL,
+                shell: nil,
+                tmuxSessionName: session.name
+            )
+        }
+
+        if selectedTerminals.isEmpty, let first = terminals.first {
+            selectedTerminals = [first.id]
+        }
     }
 
     /// Replaces the terminal with a given ID, killing the shell and restarting it at the same directory.

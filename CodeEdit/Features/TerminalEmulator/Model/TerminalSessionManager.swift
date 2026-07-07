@@ -23,6 +23,9 @@ struct TerminalSessionDescriptor: Identifiable, Equatable {
     let isRunning: Bool
     let columns: Int?
     let rows: Int?
+    /// The tmux session name backing this terminal, when tmux is the session store; `nil` for a
+    /// plain-shell fallback terminal.
+    let tmuxName: String?
 }
 
 struct TerminalProjectedSpan: Equatable {
@@ -68,6 +71,7 @@ private struct RegisteredTerminalSession {
     var title: String
     var currentDirectory: URL?
     var shell: Shell?
+    var tmuxSessionName: String?
 }
 
 final class TerminalSession: ObservableObject, Identifiable {
@@ -78,6 +82,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     let id: UUID
     let view: CELocalShellTerminalView
     let shell: Shell?
+    /// The tmux session name this terminal is attached to, or `nil` for a plain-shell terminal.
+    let tmuxSessionName: String?
 
     @Published private(set) var title: String
     @Published private(set) var currentDirectory: URL?
@@ -102,13 +108,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         view: CELocalShellTerminalView,
         shell: Shell?,
         title: String,
-        currentDirectory: URL?
+        currentDirectory: URL?,
+        tmuxSessionName: String?
     ) {
         self.id = id
         self.view = view
         self.shell = shell
         self.title = title
         self.currentDirectory = currentDirectory
+        self.tmuxSessionName = tmuxSessionName
     }
 
     func update(title: String) {
@@ -188,7 +196,8 @@ final class TerminalSession: ObservableObject, Identifiable {
             shell: shell,
             isRunning: isRunning,
             columns: view.getTerminal().cols,
-            rows: view.getTerminal().rows
+            rows: view.getTerminal().rows,
+            tmuxName: tmuxSessionName
         )
     }
 
@@ -484,6 +493,11 @@ final class TerminalSessionManager {
         sessions[id]
     }
 
+    /// The tmux session name backing a terminal id, if any (from the live session or its registration).
+    func tmuxSessionName(for id: UUID) -> String? {
+        sessions[id]?.tmuxSessionName ?? registeredSessions[id]?.tmuxSessionName
+    }
+
     func sessionDescriptors() -> [TerminalSessionDescriptor] {
         let registeredDescriptors = registeredSessionOrder.compactMap { id -> TerminalSessionDescriptor? in
             guard let registration = registeredSessions[id] else {
@@ -501,7 +515,8 @@ final class TerminalSessionManager {
                 shell: registration.shell,
                 isRunning: false,
                 columns: nil,
-                rows: nil
+                rows: nil,
+                tmuxName: registration.tmuxSessionName
             )
         }
 
@@ -517,7 +532,8 @@ final class TerminalSessionManager {
         id: UUID,
         title: String,
         currentDirectory: URL?,
-        shell: Shell?
+        shell: Shell?,
+        tmuxSessionName: String? = nil
     ) {
         if registeredSessions[id] == nil {
             registeredSessionOrder.append(id)
@@ -526,7 +542,8 @@ final class TerminalSessionManager {
         registeredSessions[id] = RegisteredTerminalSession(
             title: title,
             currentDirectory: currentDirectory,
-            shell: shell
+            shell: shell,
+            tmuxSessionName: tmuxSessionName
         )
     }
 
@@ -542,14 +559,16 @@ final class TerminalSessionManager {
         return getOrCreateSession(
             id: id,
             workspaceURL: registration.currentDirectory,
-            shell: registration.shell
+            shell: registration.shell,
+            tmuxSessionName: registration.tmuxSessionName
         ).session
     }
 
     func getOrCreateSession(
         id: UUID,
         workspaceURL: URL?,
-        shell: Shell?
+        shell: Shell?,
+        tmuxSessionName: String? = nil
     ) -> (session: TerminalSession, isNew: Bool) {
         if let session = sessions[id] {
             return (session, false)
@@ -558,18 +577,41 @@ final class TerminalSessionManager {
         let registration = registeredSessions[id]
         let currentDirectory = workspaceURL ?? registration?.currentDirectory
         let resolvedShell = shell ?? registration?.shell
+        // tmux is the session store: back every terminal with a tmux session when tmux is available,
+        // and fall back to a plain shell when it isn't. An explicit name (from the session manager) or a
+        // previously registered name wins; otherwise a stable per-terminal name is derived from the id.
+        let resolvedTmuxName: String?
+        if TmuxService.shared.isAvailable {
+            resolvedTmuxName = tmuxSessionName
+                ?? registration?.tmuxSessionName
+                ?? "codeedit-\(id.uuidString.prefix(8).lowercased())"
+        } else {
+            resolvedTmuxName = nil
+        }
         let view = CELocalShellTerminalView(frame: .zero)
-        let title = registration?.title ?? resolvedShell?.rawValue ?? "terminal"
+        let title = registration?.title ?? resolvedTmuxName ?? resolvedShell?.rawValue ?? "terminal"
         let session = TerminalSession(
             id: id,
             view: view,
             shell: resolvedShell,
             title: title,
-            currentDirectory: currentDirectory
+            currentDirectory: currentDirectory,
+            tmuxSessionName: resolvedTmuxName
         )
 
         view.sessionDelegate = session
-        view.startProcess(workspaceURL: currentDirectory, shell: resolvedShell)
+        view.startProcess(
+            workspaceURL: currentDirectory,
+            shell: resolvedShell,
+            tmuxSessionName: resolvedTmuxName
+        )
+        if resolvedTmuxName != nil {
+            // Enable tmux mouse mode shortly after the server starts so trackpad scrolling works even for
+            // the first session (before any sidebar reconcile has run). Runs off the main thread.
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.6) {
+                TmuxService.shared.enableMouseModeOnce()
+            }
+        }
         sessions[id] = session
         if registeredSessions[id] == nil {
             registeredSessionOrder.append(id)
@@ -577,7 +619,8 @@ final class TerminalSessionManager {
         registeredSessions[id] = RegisteredTerminalSession(
             title: title,
             currentDirectory: currentDirectory,
-            shell: resolvedShell
+            shell: resolvedShell,
+            tmuxSessionName: resolvedTmuxName
         )
 
         return (session, true)

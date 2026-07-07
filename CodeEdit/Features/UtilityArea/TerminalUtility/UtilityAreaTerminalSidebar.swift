@@ -13,6 +13,9 @@ struct UtilityAreaTerminalSidebar: View {
     @EnvironmentObject private var workspace: WorkspaceDocument
     @EnvironmentObject private var utilityAreaViewModel: UtilityAreaViewModel
 
+    @State private var isShowingNewTmux = false
+    @State private var newTmuxName = ""
+
     var body: some View {
         List(selection: $utilityAreaViewModel.selectedTerminals) {
             ForEach(utilityAreaViewModel.terminals, id: \.self.id) { terminal in
@@ -47,18 +50,59 @@ struct UtilityAreaTerminalSidebar: View {
                     }
                 }
             }
+            if utilityAreaViewModel.isTmuxAvailable {
+                Divider()
+                Button("New Named tmux Session…") {
+                    newTmuxName = ""
+                    isShowingNewTmux = true
+                }
+                if let selectedID = utilityAreaViewModel.selectedTerminals.first,
+                   let tmuxName = TerminalSessionManager.shared.tmuxSessionName(for: selectedID) {
+                    Button("Kill tmux Session “\(tmuxName)”", role: .destructive) {
+                        utilityAreaViewModel.killTmuxSession(name: tmuxName)
+                    }
+                }
+            }
+        }
+        .alert("New tmux session", isPresented: $isShowingNewTmux) {
+            TextField("Session name", text: $newTmuxName)
+            Button("Create") {
+                utilityAreaViewModel.addTmuxSession(name: newTmuxName, rootURL: workspace.fileURL)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Create and attach a new tmux session.")
         }
         .onChange(of: utilityAreaViewModel.terminals) { _, newValue in
             if newValue.isEmpty {
                 utilityAreaViewModel.addTerminal(rootURL: workspace.fileURL)
             }
         }
+        .onAppear {
+            utilityAreaViewModel.reconcileTmuxSessions(rootURL: workspace.fileURL)
+        }
         .paneToolbar {
             PaneToolbarSection {
-                Button {
-                    utilityAreaViewModel.addTerminal(rootURL: workspace.fileURL)
-                } label: {
-                    Image(systemName: "plus")
+                if utilityAreaViewModel.isTmuxAvailable {
+                    Menu {
+                        Button("New Named tmux Session…") {
+                            newTmuxName = ""
+                            isShowingNewTmux = true
+                        }
+                        Divider()
+                        Button("New Plain Terminal") {
+                            utilityAreaViewModel.addTerminal(rootURL: workspace.fileURL)
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .help("New tmux session")
+                } else {
+                    Button {
+                        utilityAreaViewModel.addTerminal(rootURL: workspace.fileURL)
+                    } label: {
+                        Image(systemName: "plus")
+                    }
                 }
                 Button {
                     utilityAreaViewModel.removeTerminals(utilityAreaViewModel.selectedTerminals)

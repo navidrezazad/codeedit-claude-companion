@@ -28,8 +28,11 @@ class CEActiveTaskTerminalView: CELocalShellTerminalView {
         workspaceURL url: URL?,
         shell: Shell? = nil,
         environment: [String] = [],
-        interactive: Bool = true
+        interactive: Bool = true,
+        tmuxSessionName: String? = nil
     ) {
+        // Task terminals run a single command and are not persistent tmux sessions, so the
+        // `tmuxSessionName` argument is intentionally ignored here.
         let terminalSettings = Settings.shared.preferences.terminal
 
         var terminalEnvironment: [String] = Terminal.getEnvironmentVariables()

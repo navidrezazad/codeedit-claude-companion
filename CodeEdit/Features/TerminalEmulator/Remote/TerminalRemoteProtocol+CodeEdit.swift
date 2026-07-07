@@ -14,7 +14,8 @@ extension TerminalRemoteProtocol.Session {
             shell: descriptor.shell?.rawValue,
             isRunning: descriptor.isRunning,
             columns: descriptor.columns,
-            rows: descriptor.rows
+            rows: descriptor.rows,
+            tmuxName: descriptor.tmuxName
         )
     }
 }

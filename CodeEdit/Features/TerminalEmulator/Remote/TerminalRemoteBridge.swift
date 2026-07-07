@@ -169,6 +169,10 @@ final class TerminalRemoteBridge {
             triggerMarkdownStreamUpdate(message, from: client)
         case .rewriteMarkdownStream:
             rewriteMarkdownStream(message, from: client)
+        case .createTmuxSession:
+            createTmuxSession(message, from: client)
+        case .killTmuxSession:
+            killTmuxSession(message, from: client)
         }
     }
 
@@ -189,6 +193,41 @@ final class TerminalRemoteBridge {
         }
 
         client.sendSessions()
+    }
+
+    private func createTmuxSession(_ message: TerminalRemoteProtocol.ClientMessage, from client: Client) {
+        guard
+            client.requireAuthentication(),
+            let name = message.sessionName?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !name.isEmpty
+        else {
+            return
+        }
+
+        guard TmuxService.shared.isAvailable else {
+            client.sendError("tmux is not installed on the Mac. Install it with `brew install tmux`.")
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak client] in
+            _ = TmuxService.shared.createSession(name: name)
+            client?.sendSessions()
+        }
+    }
+
+    private func killTmuxSession(_ message: TerminalRemoteProtocol.ClientMessage, from client: Client) {
+        guard
+            client.requireAuthentication(),
+            let name = message.sessionName?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !name.isEmpty
+        else {
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak client] in
+            _ = TmuxService.shared.killSession(name: name)
+            client?.sendSessions()
+        }
     }
 
     private func attach(_ message: TerminalRemoteProtocol.ClientMessage, from client: Client) {
@@ -978,9 +1017,55 @@ private extension TerminalRemoteBridge {
         }
 
         func sendSessions() {
+            // Gather CodeEdit attachment descriptors on the main thread (they touch AppKit views),
+            // then enumerate tmux sessions off-main (the tmux CLI blocks), then send the merged list.
             DispatchQueue.main.async { [weak self] in
-                let sessions = TerminalSessionManager.shared.sessionDescriptors().map(TerminalRemoteProtocol.Session.init)
-                self?.send(.init(type: .sessions, sessions: sessions))
+                guard let self else {
+                    return
+                }
+                let descriptors = TerminalSessionManager.shared.sessionDescriptors()
+                guard TmuxService.shared.isAvailable else {
+                    self.send(.init(type: .sessions, sessions: descriptors.map(TerminalRemoteProtocol.Session.init)))
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    self?.send(.init(type: .sessions, sessions: Client.tmuxSessionList(descriptors: descriptors)))
+                }
+            }
+        }
+
+        /// Builds the session list from tmux (the session store), merging live column/row info from any
+        /// CodeEdit terminal currently attached to each tmux session. Falls back to the raw CodeEdit
+        /// descriptors when there are no tmux sessions yet.
+        private static func tmuxSessionList(
+            descriptors: [TerminalSessionDescriptor]
+        ) -> [TerminalRemoteProtocol.Session] {
+            let tmuxSessions = TmuxService.shared.listSessions()
+            guard !tmuxSessions.isEmpty else {
+                return descriptors.map(TerminalRemoteProtocol.Session.init)
+            }
+
+            var descriptorByName: [String: TerminalSessionDescriptor] = [:]
+            for descriptor in descriptors {
+                if let name = descriptor.tmuxName {
+                    descriptorByName[name] = descriptor
+                }
+            }
+
+            return tmuxSessions.map { info in
+                let descriptor = descriptorByName[info.name]
+                return TerminalRemoteProtocol.Session(
+                    id: TmuxService.shared.id(forSessionNamed: info.name),
+                    title: info.name,
+                    currentDirectory: info.currentPath ?? descriptor?.currentDirectory?.path,
+                    shell: descriptor?.shell?.rawValue,
+                    isRunning: true,
+                    columns: descriptor?.columns,
+                    rows: descriptor?.rows,
+                    tmuxName: info.name,
+                    windowCount: info.windows,
+                    attached: info.attached
+                )
             }
         }
 
@@ -1095,50 +1180,70 @@ private extension TerminalRemoteBridge {
         }
 
         func attach(to sessionID: UUID, includeRecent: Bool) {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else {
-                    return
-                }
+            // Resolve the tmux session name off-main (the tmux CLI blocks), then register + attach on main.
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let tmuxName = TmuxService.shared.isAvailable
+                    ? TmuxService.shared.sessionName(forID: sessionID)
+                    : nil
 
-                guard let session = TerminalSessionManager.shared.ensureSession(sessionID) else {
-                    self.sendError("Terminal session not found.")
-                    return
-                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else {
+                        return
+                    }
 
-                if self.outputSubscriptions[sessionID] == nil {
-                    self.outputSubscriptions[sessionID] = session.subscribeToProjectedOutput { [weak self] projection in
-                        guard projection.hasMeaningfulText else {
-                            return
-                        }
-
-                        self?.send(
-                            .init(
-                                type: .output,
-                                sessionID: sessionID,
-                                projectedOutput: Self.remoteProjectedOutput(from: projection)
-                            )
+                    // If this id is a tmux session that no CodeEdit terminal is backing yet, register it
+                    // so `ensureSession` opens `tmux new -A -s NAME` and mirrors it.
+                    if let tmuxName, TerminalSessionManager.shared.getSession(sessionID) == nil {
+                        TerminalSessionManager.shared.registerTerminal(
+                            id: sessionID,
+                            title: tmuxName,
+                            currentDirectory: nil,
+                            shell: nil,
+                            tmuxSessionName: tmuxName
                         )
                     }
-                }
 
-                if self.inputSubscriptions[sessionID] == nil {
-                    self.inputSubscriptions[sessionID] = session.subscribeToInput { [weak self] bytes in
-                        self?.send(.init(type: .input, sessionID: sessionID, data: Data(bytes)))
+                    guard let session = TerminalSessionManager.shared.ensureSession(sessionID) else {
+                        self.sendError("Terminal session not found.")
+                        return
                     }
-                }
 
-                if includeRecent,
-                   let output = TerminalSessionManager.shared.recentProjectedOutput(for: sessionID) {
-                    self.send(
-                            .init(
-                                type: .output,
-                                sessionID: sessionID,
-                                projectedOutput: Self.remoteProjectedOutput(from: output)
-                            )
-                    )
-                }
+                    if self.outputSubscriptions[sessionID] == nil {
+                        self.outputSubscriptions[sessionID] = session
+                            .subscribeToProjectedOutput { [weak self] projection in
+                                guard projection.hasMeaningfulText else {
+                                    return
+                                }
 
-                self.sendSessions()
+                                self?.send(
+                                    .init(
+                                        type: .output,
+                                        sessionID: sessionID,
+                                        projectedOutput: Self.remoteProjectedOutput(from: projection)
+                                    )
+                                )
+                            }
+                    }
+
+                    if self.inputSubscriptions[sessionID] == nil {
+                        self.inputSubscriptions[sessionID] = session.subscribeToInput { [weak self] bytes in
+                            self?.send(.init(type: .input, sessionID: sessionID, data: Data(bytes)))
+                        }
+                    }
+
+                    if includeRecent,
+                       let output = TerminalSessionManager.shared.recentProjectedOutput(for: sessionID) {
+                        self.send(
+                                .init(
+                                    type: .output,
+                                    sessionID: sessionID,
+                                    projectedOutput: Self.remoteProjectedOutput(from: output)
+                                )
+                        )
+                    }
+
+                    self.sendSessions()
+                }
             }
         }
 

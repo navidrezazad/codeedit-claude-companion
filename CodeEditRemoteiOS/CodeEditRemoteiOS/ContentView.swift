@@ -37,6 +37,8 @@ struct ContentView: View {
     @State private var selectedTab = AppTab.terminals
     @State private var terminalDisplayMode = TerminalDisplayMode.terminal
     @State private var isShowingScanner = false
+    @State private var isShowingNewSession = false
+    @State private var newSessionName = ""
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -323,6 +325,16 @@ struct ContentView: View {
             }
 
             Button {
+                newSessionName = ""
+                isShowingNewSession = true
+            } label: {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel("New tmux session")
+
+            Button {
                 client.refreshSessions()
             } label: {
                 Image(systemName: "arrow.clockwise")
@@ -343,6 +355,17 @@ struct ContentView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(Color(uiColor: .systemBackground))
+        .alert("New tmux session", isPresented: $isShowingNewSession) {
+            TextField("Session name", text: $newSessionName)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Create") {
+                client.createTmuxSession(name: newSessionName)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Create a new tmux session on the Mac. It will appear in the list.")
+        }
     }
 
     private var terminalModePicker: some View {
@@ -418,6 +441,15 @@ struct ContentView: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            if let tmuxName = session.tmuxName {
+                Button(role: .destructive) {
+                    client.killTmuxSession(name: tmuxName)
+                } label: {
+                    Label("Kill \"\(tmuxName)\"", systemImage: "trash")
+                }
+            }
+        }
     }
 
     private var filesView: some View {
@@ -490,7 +522,10 @@ struct ContentView: View {
     }
 
     private func terminalSubtitle(for session: TerminalRemoteProtocol.Session) -> String {
-        let state = session.isRunning ? "Running" : "Ready"
+        var state = session.isRunning ? "Running" : "Ready"
+        if let windows = session.windowCount {
+            state += " · \(windows)w"
+        }
         guard let currentDirectory = session.currentDirectory, !currentDirectory.isEmpty else {
             return state
         }

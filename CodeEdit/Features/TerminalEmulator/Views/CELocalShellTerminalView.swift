@@ -52,6 +52,7 @@ class CELocalShellTerminalView: CETerminalView, TerminalViewDelegate, LocalProce
     var process: LocalProcess!
     private var lastReportedTerminalColumns: Int?
     private var lastReportedTerminalRows: Int?
+    private var scrollEventMonitor: Any?
 
     override public init(frame: CGRect) {
         super.init(frame: frame)
@@ -72,6 +73,7 @@ class CELocalShellTerminalView: CETerminalView, TerminalViewDelegate, LocalProce
         terminal = Terminal(delegate: self, options: TerminalOptions(scrollback: 10000))
         terminalDelegate = self
         process = LocalProcess(delegate: self)
+        installScrollForwardingMonitor()
     }
 
     /// Launches a child process inside a pseudo-terminal.
@@ -82,7 +84,8 @@ class CELocalShellTerminalView: CETerminalView, TerminalViewDelegate, LocalProce
         workspaceURL url: URL?,
         shell: Shell? = nil,
         environment: [String] = [],
-        interactive: Bool = true
+        interactive: Bool = true,
+        tmuxSessionName: String? = nil
     ) {
         lastReportedTerminalColumns = nil
         lastReportedTerminalRows = nil
@@ -90,6 +93,26 @@ class CELocalShellTerminalView: CETerminalView, TerminalViewDelegate, LocalProce
 
         var terminalEnvironment: [String] = Terminal.getEnvironmentVariables()
         terminalEnvironment.append("TERM_PROGRAM=CodeEditApp_Terminal")
+
+        // tmux-backed session: run `tmux new-session -A -s NAME` as the PTY's leaf process so the
+        // session lives in (and persists via) the tmux server; the user's shell runs inside tmux.
+        // When tmux is not installed, `attachCommand` returns nil and we fall through to a plain shell.
+        if let tmuxSessionName,
+           let (tmuxURL, tmuxArgs) = TmuxService.shared.attachCommand(
+               forSessionNamed: tmuxSessionName,
+               currentDirectory: url?.absolutePath
+           ) {
+            processDelegate?.setTerminalTitle(source: self, title: tmuxSessionName)
+            terminalEnvironment.append(contentsOf: environment)
+            process.startProcess(
+                executable: tmuxURL.path,
+                args: tmuxArgs,
+                environment: terminalEnvironment,
+                execName: "tmux",
+                currentDirectory: url?.absolutePath
+            )
+            return
+        }
 
         guard let (shell, shellPath) = getShell(shell, userSetting: terminalSettings.shell) else {
             return
@@ -189,6 +212,65 @@ class CELocalShellTerminalView: CETerminalView, TerminalViewDelegate, LocalProce
 
     public func scrolled(source: TerminalView, position: Double) {
         updateScrollbackReadingState(position: position)
+    }
+
+    /// tmux and other full-screen programs run on the alternate screen (where SwiftTerm's own scrollback
+    /// is empty), and SwiftTerm never forwards scroll to the program — and its default keys off `deltaY`,
+    /// which is `0` for the trackpad's precise deltas, so scrolling looked broken. SwiftTerm's
+    /// `scrollWheel` isn't `open`, so rather than overriding it we intercept scroll events with a local
+    /// monitor and, when the program has mouse reporting on and the pointer is over this terminal,
+    /// forward them as wheel-button mouse events (which tmux turns into copy-mode scrolling).
+    private func installScrollForwardingMonitor() {
+        scrollEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self, self.forwardScrollToProgram(event) else {
+                return event
+            }
+            return nil
+        }
+    }
+
+    private func forwardScrollToProgram(_ event: NSEvent) -> Bool {
+        guard let window, event.window === window else {
+            return false
+        }
+        let terminal = getTerminal()
+        guard terminal.mouseMode != .off else {
+            return false
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point) else {
+            return false
+        }
+
+        let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
+        guard delta != 0 else {
+            return false
+        }
+
+        let cols = max(terminal.cols, 1)
+        let rows = max(terminal.rows, 1)
+        let col = min(max(Int(point.x / (bounds.width / CGFloat(cols))), 0), cols - 1)
+        let row = min(max(Int((bounds.height - point.y) / (bounds.height / CGFloat(rows))), 0), rows - 1)
+        let divisor: CGFloat = event.hasPreciseScrollingDeltas ? 8 : 1
+        let clicks = min(max(Int(abs(delta) / divisor), 1), 4)
+        let flags = event.modifierFlags
+        let buttonFlags = terminal.encodeButton(
+            button: delta > 0 ? 4 : 5, // 4 = wheel up, 5 = wheel down
+            release: false,
+            shift: flags.contains(.shift),
+            meta: flags.contains(.option),
+            control: flags.contains(.control)
+        )
+        for _ in 0..<clicks {
+            terminal.sendEvent(buttonFlags: buttonFlags, x: col, y: row)
+        }
+        return true
+    }
+
+    deinit {
+        if let scrollEventMonitor {
+            NSEvent.removeMonitor(scrollEventMonitor)
+        }
     }
 
     // MARK: - LocalProcessDelegate
