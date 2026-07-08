@@ -70,6 +70,7 @@ private struct RegisteredTerminalSession {
     var shell: Shell?
 }
 
+// swiftlint:disable:next type_body_length
 final class TerminalSession: ObservableObject, Identifiable {
     typealias ByteHandler = (ArraySlice<UInt8>) -> Void
     typealias ProjectedOutputHandler = (TerminalProjectedOutput) -> Void
@@ -89,9 +90,12 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var projectedOutputSequence = 0
     private var lastProjectedColumns = 0
     private var lastProjectedRows = 0
+    private var pendingProjectedOutputRange: (startY: Int, endY: Int)?
+    private var pendingProjectedOutputWorkItem: DispatchWorkItem?
     private var screenMode: TerminalRemoteProtocol.ScreenMode = .main
     private var terminalControlTail = ""
     private let maxProjectedRows = 5_000
+    private let projectedOutputPublishDelay: DispatchTimeInterval = .milliseconds(33)
 
     var isRunning: Bool {
         view.process?.running == true
@@ -144,6 +148,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         inputSubscribers[token] = nil
         projectedOutputSubscribers[token] = nil
         rawOutputSubscribers[token] = nil
+
+        if projectedOutputSubscribers.isEmpty {
+            pendingProjectedOutputWorkItem?.cancel()
+            pendingProjectedOutputWorkItem = nil
+            pendingProjectedOutputRange = nil
+        }
     }
 
     func sendInput(_ bytes: ArraySlice<UInt8>) {
@@ -155,22 +165,35 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func recentProjectedOutputSnapshot() -> TerminalProjectedOutput? {
-        let rows = projectedRows.keys
-            .sorted()
-            .compactMap { row -> TerminalProjectedRow? in
-                guard let content = projectedRows[row],
-                      !content.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    return nil
+        let terminal = view.getTerminal()
+        lastProjectedColumns = terminal.cols
+        lastProjectedRows = terminal.rows
+
+        let startRow = terminal.buffer.yDisp
+        let endRow = startRow + max(0, terminal.rows - 1)
+        var rows: [TerminalProjectedRow] = []
+
+        if startRow <= endRow {
+            for row in startRow...endRow {
+                guard let line = terminal.getScrollInvariantLine(row: row) else {
+                    continue
                 }
 
-                return TerminalProjectedRow(row: row, text: content.text, spans: content.spans)
+                let content = Self.projectedRowContent(from: line)
+                projectedRows[row] = content
+
+                guard !content.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    continue
+                }
+
+                rows.append(TerminalProjectedRow(row: row, text: content.text, spans: content.spans))
             }
+        }
 
         guard !rows.isEmpty else {
             return nil
         }
 
-        let terminal = view.getTerminal()
         return TerminalProjectedOutput(
             sequence: projectedOutputSequence,
             screenMode: screenMode,
@@ -200,19 +223,20 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     fileprivate func publishRenderedOutputIfNeeded() {
-        guard let projection = renderedOutputProjection() else {
+        guard !projectedOutputSubscribers.isEmpty else {
             return
         }
 
-        projectedOutputSubscribers.values.forEach { $0(projection) }
+        recordRenderedOutputUpdate()
     }
 
     fileprivate func publishInput(_ bytes: ArraySlice<UInt8>) {
         inputSubscribers.values.forEach { $0(bytes) }
     }
 
-    private func renderedOutputProjection() -> TerminalProjectedOutput? {
+    private func recordRenderedOutputUpdate() {
         let terminal = view.getTerminal()
+        var recordedUpdate = false
 
         // A window/pane resize reflows the whole SwiftTerm buffer, which renumbers the scroll-invariant
         // row indices the mirror keys on. The wire protocol overwrites rows by index and has no
@@ -225,15 +249,92 @@ final class TerminalSession: ObservableObject, Identifiable {
             lastProjectedRows = terminal.rows
             projectedRows.removeAll(keepingCapacity: true)
             projectedOutputSequence = 0
-            terminal.refresh(startRow: 0, endRow: max(0, terminal.rows - 1))
+            mergePendingProjectedOutputRange(
+                startY: terminal.buffer.yDisp,
+                endY: terminal.buffer.yDisp + max(0, terminal.rows - 1)
+            )
+            recordedUpdate = true
         }
 
-        guard let range = terminal.getScrollInvariantUpdateRange() else {
+        if let range = terminal.getScrollInvariantUpdateRange() {
+            mergePendingProjectedOutputRange(startY: range.startY, endY: range.endY)
+            recordedUpdate = true
+        }
+
+        guard recordedUpdate || pendingProjectedOutputRange != nil else {
+            return
+        }
+
+        schedulePendingProjectedOutputPublish()
+    }
+
+    private func mergePendingProjectedOutputRange(startY: Int, endY: Int) {
+        let lowerBound = min(startY, endY)
+        let upperBound = max(startY, endY)
+        let cappedStart = max(lowerBound, upperBound - maxProjectedRows + 1)
+
+        if let pendingProjectedOutputRange {
+            self.pendingProjectedOutputRange = (
+                startY: min(pendingProjectedOutputRange.startY, cappedStart),
+                endY: max(pendingProjectedOutputRange.endY, upperBound)
+            )
+        } else {
+            pendingProjectedOutputRange = (startY: cappedStart, endY: upperBound)
+        }
+    }
+
+    private func schedulePendingProjectedOutputPublish() {
+        guard pendingProjectedOutputWorkItem == nil else {
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.publishPendingProjectedOutput()
+        }
+        pendingProjectedOutputWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + projectedOutputPublishDelay, execute: workItem)
+    }
+
+    private func publishPendingProjectedOutput() {
+        pendingProjectedOutputWorkItem = nil
+
+        guard !projectedOutputSubscribers.isEmpty else {
+            pendingProjectedOutputRange = nil
+            return
+        }
+
+        guard let range = pendingProjectedOutputRange else {
+            return
+        }
+        pendingProjectedOutputRange = nil
+
+        guard let projection = renderedOutputProjection(for: range) else {
+            return
+        }
+
+        projectedOutputSubscribers.values.forEach { $0(projection) }
+    }
+
+    private func renderedOutputProjection(
+        for range: (startY: Int, endY: Int)
+    ) -> TerminalProjectedOutput? {
+        let terminal = view.getTerminal()
+        var startRow = min(range.startY, range.endY)
+        var endRow = max(range.startY, range.endY)
+
+        if terminal.cols != lastProjectedColumns || terminal.rows != lastProjectedRows {
+            lastProjectedColumns = terminal.cols
+            lastProjectedRows = terminal.rows
+            projectedRows.removeAll(keepingCapacity: true)
+            projectedOutputSequence = 0
+            startRow = terminal.buffer.yDisp
+            endRow = terminal.buffer.yDisp + max(0, terminal.rows - 1)
+        }
+
+        guard startRow <= endRow else {
             return nil
         }
 
-        let startRow = min(range.startY, range.endY)
-        let endRow = max(range.startY, range.endY)
         var rows: [TerminalProjectedRow] = []
 
         for row in startRow...endRow {

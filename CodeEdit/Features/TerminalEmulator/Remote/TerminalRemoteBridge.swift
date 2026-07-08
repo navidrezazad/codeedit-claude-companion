@@ -1198,13 +1198,15 @@ private extension TerminalRemoteBridge {
                             return
                         }
 
-                        self?.send(
-                            .init(
-                                type: .output,
-                                sessionID: sessionID,
-                                projectedOutput: Self.remoteProjectedOutput(from: projection)
+                        self?.bridge?.queue.async { [weak self] in
+                            self?.send(
+                                .init(
+                                    type: .output,
+                                    sessionID: sessionID,
+                                    projectedOutput: Self.remoteProjectedOutput(from: projection)
+                                )
                             )
-                        )
+                        }
                     }
                 }
 
@@ -1216,13 +1218,15 @@ private extension TerminalRemoteBridge {
 
                 if includeRecent,
                    let output = TerminalSessionManager.shared.recentProjectedOutput(for: sessionID) {
-                    self.send(
+                    self.bridge?.queue.async { [weak self] in
+                        self?.send(
                             .init(
                                 type: .output,
                                 sessionID: sessionID,
                                 projectedOutput: Self.remoteProjectedOutput(from: output)
                             )
-                    )
+                        )
+                    }
                 }
 
                 self.sendSessions()
