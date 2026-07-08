@@ -200,12 +200,16 @@ struct TerminalEmulatorView: NSViewRepresentable {
             source = result.isNew ? "new-shared-session" : "shared-session"
             if result.isNew {
                 configureView(view, forceRedraw: false)
-            } else if getConfigurationSignature(terminalID) != configurationSignature {
-                configureView(view, forceRedraw: true)
+            } else {
+                view.prepareForAttachmentLayout()
+                if getConfigurationSignature(terminalID) != configurationSignature {
+                    configureView(view, forceRedraw: true)
+                }
             }
         case .task(let activeTask):
             if let output = activeTask.output {
                 view = output
+                view.prepareForAttachmentLayout()
             } else {
                 let newView = CEActiveTaskTerminalView(activeTask: activeTask)
                 activeTask.output = newView

@@ -262,7 +262,8 @@ final class TerminalRemoteBridge {
         client.startMarkdownStream(
             sessionID: sessionID,
             prompt: prompt,
-            streamID: message.streamID ?? UUID()
+            streamID: message.streamID ?? UUID(),
+            resumePath: message.path
         )
     }
 
@@ -508,6 +509,9 @@ final class TerminalRemoteBridge {
             in: markdown,
             baseURL: fileURL.deletingLastPathComponent()
         )
+        if markdownWithImages.utf8.count > maxMarkdownBytes {
+            throw FileAccessError.markdownTooLarge
+        }
         let document = TerminalRemoteProtocol.MarkdownDocument(
             path: fileURL.path,
             name: fileURL.lastPathComponent,
@@ -521,7 +525,10 @@ final class TerminalRemoteBridge {
         streamID: UUID,
         sessionID: UUID,
         fileURL: URL,
-        isActive: Bool
+        isActive: Bool,
+        revision: Int,
+        updateKind: TerminalRemoteProtocol.MarkdownStreamUpdateKind,
+        status: TerminalRemoteProtocol.MarkdownStreamStatus
     ) throws -> TerminalRemoteProtocol.ServerMessage {
         let values = try fileURL.resourceValues(forKeys: [.fileSizeKey])
         if let fileSize = values.fileSize, fileSize > maxMarkdownStreamBytes {
@@ -533,19 +540,33 @@ final class TerminalRemoteBridge {
             in: markdown,
             baseURL: fileURL.deletingLastPathComponent()
         )
+        if markdownWithImages.utf8.count > maxMarkdownStreamBytes {
+            throw FileAccessError.markdownTooLarge
+        }
         let document = TerminalRemoteProtocol.MarkdownStreamDocument(
             streamID: streamID,
             sessionID: sessionID,
             path: fileURL.path,
             name: fileURL.lastPathComponent,
             markdown: markdownWithImages,
-            isActive: isActive
+            isActive: isActive,
+            revision: revision,
+            updateKind: updateKind,
+            status: status
         )
 
         return .init(type: .markdownStream, markdownStream: document)
     }
 
-    private func makeMarkdownStreamFileURL(streamID: UUID, sessionID: UUID) throws -> URL {
+    private func makeMarkdownStreamFileURL(streamID: UUID, sessionID: UUID, resumePath: String? = nil) throws -> URL {
+        if let resumeURL = markdownStreamResumeFileURL(streamID: streamID, path: resumePath) {
+            try FileManager.default.createDirectory(
+                at: resumeURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            return resumeURL
+        }
+
         let candidateURLs = markdownStreamDirectoryCandidateURLs(sessionID: sessionID)
         var lastError: Error?
 
@@ -562,6 +583,60 @@ final class TerminalRemoteBridge {
         }
 
         throw lastError ?? FileAccessError.notDirectory
+    }
+
+    private func markdownStreamResumeFileURL(streamID: UUID, path: String?) -> URL? {
+        guard let path = path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else {
+            return nil
+        }
+
+        let expectedFileName = "stream-\(streamID.uuidString).md"
+        let requestedURL = URL(fileURLWithPath: path).standardizedFileURL
+        guard requestedURL.lastPathComponent == expectedFileName else {
+            return nil
+        }
+
+        let requestedPath = requestedURL.path
+        let isProjectStreamPath = requestedPath.contains("/.codeeditv2/markdown-streams/")
+        let isApplicationSupportStreamPath: Bool
+        if let applicationSupportURL = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first {
+            let streamRootPath = applicationSupportURL
+                .appendingPathComponent("CodeEditV2", isDirectory: true)
+                .appendingPathComponent("RemoteMarkdownStreams", isDirectory: true)
+                .standardizedFileURL
+                .path
+            isApplicationSupportStreamPath = requestedPath.hasPrefix(streamRootPath + "/")
+        } else {
+            isApplicationSupportStreamPath = false
+        }
+
+        guard isProjectStreamPath || isApplicationSupportStreamPath else {
+            return nil
+        }
+
+        let fileManager = FileManager.default
+        let homeURL = fileManager.homeDirectoryForCurrentUser.standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedURL: URL
+
+        if fileManager.fileExists(atPath: requestedURL.path) {
+            resolvedURL = requestedURL.resolvingSymlinksInPath()
+        } else {
+            let resolvedParentURL = requestedURL
+                .deletingLastPathComponent()
+                .resolvingSymlinksInPath()
+            resolvedURL = resolvedParentURL.appendingPathComponent(expectedFileName)
+        }
+
+        let homePath = homeURL.path
+        let resolvedPath = resolvedURL.standardizedFileURL.path
+        guard resolvedPath == homePath || resolvedPath.hasPrefix(homePath + "/") else {
+            return nil
+        }
+
+        return resolvedURL
     }
 
     private func markdownStreamDirectoryCandidateURLs(sessionID: UUID) -> [URL] {
@@ -1006,17 +1081,28 @@ private extension TerminalRemoteBridge {
             }
         }
 
-        func startMarkdownStream(sessionID: UUID, prompt: String, streamID: UUID) {
+        func startMarkdownStream(sessionID: UUID, prompt: String, streamID: UUID, resumePath: String?) {
             guard let bridge else {
                 return
             }
 
             do {
-                let fileURL = try bridge.makeMarkdownStreamFileURL(streamID: streamID, sessionID: sessionID)
-                let initialMarkdown = markdownStreamPreamble(prompt: prompt, streamFileURL: fileURL)
-                try initialMarkdown.write(to: fileURL, atomically: true, encoding: .utf8)
+                let fileURL = try bridge.makeMarkdownStreamFileURL(
+                    streamID: streamID,
+                    sessionID: sessionID,
+                    resumePath: resumePath
+                )
+                let fileExists = FileManager.default.fileExists(atPath: fileURL.path)
+                if !fileExists {
+                    let initialMarkdown = markdownStreamPreamble(prompt: prompt, streamFileURL: fileURL)
+                    try initialMarkdown.write(to: fileURL, atomically: true, encoding: .utf8)
+                }
 
-                markdownStreams[streamID]?.cancel(sendFinalSnapshot: false)
+                if let existingWatcher = markdownStreams[streamID] {
+                    existingWatcher.publishCurrentSnapshot()
+                    return
+                }
+
                 let watcher = MarkdownStreamWatcher(
                     streamID: streamID,
                     sessionID: sessionID,
@@ -1026,12 +1112,7 @@ private extension TerminalRemoteBridge {
                 )
                 markdownStreams[streamID] = watcher
                 watcher.start()
-                sendMarkdownStreamSnapshot(
-                    streamID: streamID,
-                    sessionID: sessionID,
-                    fileURL: fileURL,
-                    isActive: true
-                )
+                watcher.publishCurrentSnapshot()
             } catch {
                 sendError(error.localizedDescription)
             }
@@ -1069,14 +1150,20 @@ private extension TerminalRemoteBridge {
             streamID: UUID,
             sessionID: UUID,
             fileURL: URL,
-            isActive: Bool
+            isActive: Bool,
+            revision: Int,
+            updateKind: TerminalRemoteProtocol.MarkdownStreamUpdateKind,
+            status: TerminalRemoteProtocol.MarkdownStreamStatus
         ) {
             do {
                 let message = try bridge?.markdownStreamMessage(
                     streamID: streamID,
                     sessionID: sessionID,
                     fileURL: fileURL,
-                    isActive: isActive
+                    isActive: isActive,
+                    revision: revision,
+                    updateKind: updateKind,
+                    status: status
                 )
                 if let message {
                     send(message)
@@ -1246,8 +1333,6 @@ private extension TerminalRemoteBridge {
             """
             # Markdown Stream Agent
 
-            **Status:** Watching terminal output for manual Claude updates
-
             **Stream file:** `\(streamFileURL.path)`
             **Instruction:** \(prompt)
 
@@ -1292,6 +1377,11 @@ private extension TerminalRemoteBridge {
             private let initialPrompt: String
             private var timer: DispatchSourceTimer?
             private var lastSignature = ""
+            private var revision = 0
+            private var streamStatus = TerminalRemoteProtocol.MarkdownStreamStatus(
+                phase: .starting,
+                title: "Starting Markdown stream"
+            )
             private var outputSubscriptionToken: UUID?
             private var rawOutputSubscriptionToken: UUID?
             private var inputSubscriptionToken: UUID?
@@ -1299,6 +1389,10 @@ private extension TerminalRemoteBridge {
             private var currentTerminalPrompt: String?
             private var terminalRawCapture = Data()
             private var hasMeaningfulRawCapture = false
+            private var shellIntegrationBuffer = ""
+            private var pendingShellCommandFinished = false
+            private var rawCaptureWasTruncated = false
+            private var projectedCaptureWasTruncated = false
             private var terminalOutputRows: [Int: String] = [:]
             private var terminalOutputRowOrder: [Int] = []
             private var terminalOutputCharacterCount = 0
@@ -1314,6 +1408,7 @@ private extension TerminalRemoteBridge {
             private let maxStatusDetailCharacters = 4_000
             /// Idle window after the last terminal output chunk before the Markdown update runs on its own.
             private let autoUpdateIdleDelay: DispatchTimeInterval = .milliseconds(2_000)
+            private let commandFinishedUpdateDelay: DispatchTimeInterval = .milliseconds(300)
 
             init(
                 streamID: UUID,
@@ -1334,17 +1429,24 @@ private extension TerminalRemoteBridge {
                 subscribeToTerminalEvents()
             }
 
+            func publishCurrentSnapshot() {
+                publishIfChanged(isActive: true, force: true, updateKind: .snapshot)
+            }
+
             func triggerUpdate() {
                 guard !isCancelled else {
                     return
                 }
 
-                guard currentTerminalPrompt != nil else {
-                    appendStatusBlock(
-                        status: "No pending Markdown update",
-                        detail: "Run a terminal command first, then press Update after its output appears."
-                    )
-                    return
+                if currentTerminalPrompt == nil {
+                    guard captureRecentTerminalProjectionForManualUpdate() else {
+                        setStatus(
+                            .watching,
+                            title: "No pending Markdown update",
+                            detail: "Run a terminal command first, then press Update after its output appears."
+                        )
+                        return
+                    }
                 }
 
                 startClaudeUpdateIfPossible()
@@ -1357,16 +1459,18 @@ private extension TerminalRemoteBridge {
 
                 let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmedPrompt.isEmpty else {
-                    appendStatusBlock(
-                        status: "No rewrite prompt",
+                    setStatus(
+                        .error,
+                        title: "No rewrite prompt",
                         detail: "Enter rewrite instructions before asking Claude to rewrite the Markdown file."
                     )
                     return
                 }
 
                 guard !isClaudeRunning else {
-                    appendStatusBlock(
-                        status: "Claude busy",
+                    setStatus(
+                        .queued,
+                        title: "Claude busy",
                         detail: "Wait for the current Claude Markdown job to finish, then try the rewrite again."
                     )
                     return
@@ -1374,7 +1478,7 @@ private extension TerminalRemoteBridge {
 
                 let currentMarkdown = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
                 isClaudeRunning = true
-                updateStatusLine("Rewriting full Markdown file with Claude")
+                setStatus(.rewriting, title: "Rewriting Markdown")
                 runClaudeRewrite(userPrompt: trimmedPrompt, currentMarkdown: currentMarkdown)
             }
 
@@ -1408,7 +1512,7 @@ private extension TerminalRemoteBridge {
                 inputSubscriptionToken = nil
 
                 if sendFinalSnapshot {
-                    publishIfChanged(isActive: false, force: true)
+                    setStatus(.stopped, title: "Markdown stream stopped", publishActive: false, force: true)
                 }
             }
 
@@ -1434,8 +1538,9 @@ private extension TerminalRemoteBridge {
 
                     guard let session = TerminalSessionManager.shared.ensureSession(self.sessionID) else {
                         self.client?.bridge?.queue.async { [weak self] in
-                            self?.appendStatusBlock(
-                                status: "Terminal session not found",
+                            self?.setStatus(
+                                .error,
+                                title: "Terminal session not found",
                                 detail: "CodeEditV2 could not attach the Markdown stream watcher to the selected terminal."
                             )
                         }
@@ -1477,7 +1582,7 @@ private extension TerminalRemoteBridge {
                         self.outputSubscriptionToken = token
                         self.rawOutputSubscriptionToken = rawToken
                         self.inputSubscriptionToken = inputToken
-                        self.updateStatusLine("Watching terminal input")
+                        self.setStatus(.watching, title: "Watching terminal input")
                     }
                 }
             }
@@ -1527,37 +1632,50 @@ private extension TerminalRemoteBridge {
                 currentTerminalPrompt = Self.cappedSuffix(prompt, limit: maxTerminalPromptCharacters)
                 terminalRawCapture.removeAll(keepingCapacity: true)
                 hasMeaningfulRawCapture = false
+                rawCaptureWasTruncated = false
+                projectedCaptureWasTruncated = false
+                pendingShellCommandFinished = false
                 terminalOutputRows.removeAll(keepingCapacity: true)
                 terminalOutputRowOrder.removeAll(keepingCapacity: true)
                 terminalOutputCharacterCount = 0
                 needsFollowUpRun = false
                 cancelAutomaticUpdate()
-                updateStatusLine("Waiting for command output")
+                setStatus(.capturing, title: "Waiting for command output")
             }
 
             private func appendRawOutput(
                 _ data: Data,
                 screenMode: TerminalRemoteProtocol.ScreenMode
             ) {
-                guard !isCancelled, currentTerminalPrompt != nil, !data.isEmpty else {
+                guard !isCancelled, !data.isEmpty else {
+                    return
+                }
+
+                processShellIntegrationEvents(in: Self.decodedTerminalText(from: data))
+
+                guard currentTerminalPrompt != nil else {
+                    pendingShellCommandFinished = false
                     return
                 }
 
                 guard screenMode == .main else {
+                    finishPendingShellCommandIfNeeded()
                     return
                 }
 
                 terminalRawCapture.append(data)
                 if terminalRawCapture.count > maxTerminalDeltaBytes {
                     terminalRawCapture.removeFirst(terminalRawCapture.count - maxTerminalDeltaBytes)
+                    rawCaptureWasTruncated = true
                 }
 
                 if !hasMeaningfulRawCapture,
                    Self.hasMeaningfulTerminalText(in: Self.plainTerminalText(from: data)) {
                     hasMeaningfulRawCapture = true
-                    updateStatusLine("Capturing terminal output")
+                    setStatus(.capturing, title: "Capturing terminal output", isTruncated: captureWasTruncated())
                 }
                 scheduleAutomaticUpdate()
+                finishPendingShellCommandIfNeeded()
             }
 
             private func appendTerminalOutput(_ projection: TerminalProjectedOutput) {
@@ -1576,9 +1694,29 @@ private extension TerminalRemoteBridge {
                 }
                 trimTerminalOutputRowsIfNeeded()
                 if wasEmpty, terminalOutputCharacterCount > 0 {
-                    updateStatusLine("Capturing terminal output")
+                    setStatus(.capturing, title: "Capturing terminal output", isTruncated: captureWasTruncated())
                 }
                 scheduleAutomaticUpdate()
+            }
+
+            private func captureRecentTerminalProjectionForManualUpdate() -> Bool {
+                guard let output = recentTerminalProjection(), output.hasMeaningfulText else {
+                    return false
+                }
+
+                armForTerminalPrompt("Visible terminal output")
+                appendTerminalOutput(output)
+                return terminalOutputCharacterCount > 0
+            }
+
+            private func recentTerminalProjection() -> TerminalProjectedOutput? {
+                if Thread.isMainThread {
+                    return TerminalSessionManager.shared.getSession(sessionID)?.recentProjectedOutputSnapshot()
+                }
+
+                return DispatchQueue.main.sync {
+                    TerminalSessionManager.shared.getSession(sessionID)?.recentProjectedOutputSnapshot()
+                }
             }
 
             private func terminalOutputText() -> String {
@@ -1592,6 +1730,7 @@ private extension TerminalRemoteBridge {
                       let firstRow = terminalOutputRowOrder.first {
                     terminalOutputCharacterCount -= terminalOutputRows.removeValue(forKey: firstRow)?.count ?? 0
                     terminalOutputRowOrder.removeFirst()
+                    projectedCaptureWasTruncated = true
                 }
             }
 
@@ -1604,6 +1743,102 @@ private extension TerminalRemoteBridge {
                 return terminalOutputText()
             }
 
+            private func captureWasTruncated(delta: String? = nil) -> Bool {
+                rawCaptureWasTruncated
+                    || projectedCaptureWasTruncated
+                    || terminalRawCapture.count >= maxTerminalDeltaBytes
+                    || terminalOutputCharacterCount >= maxTerminalDeltaCharacters
+                    || (delta?.count ?? 0) >= maxTerminalDeltaCharacters
+            }
+
+            private func processShellIntegrationEvents(in text: String) {
+                guard !text.isEmpty else {
+                    return
+                }
+
+                shellIntegrationBuffer += text
+                parseShellIntegrationBuffer()
+                if shellIntegrationBuffer.count > 8_000 {
+                    shellIntegrationBuffer = String(shellIntegrationBuffer.suffix(4_000))
+                }
+            }
+
+            private func parseShellIntegrationBuffer() {
+                let prefix = "\u{001B}]133;"
+
+                while let prefixRange = shellIntegrationBuffer.range(of: prefix) {
+                    if prefixRange.lowerBound > shellIntegrationBuffer.startIndex {
+                        shellIntegrationBuffer.removeSubrange(shellIntegrationBuffer.startIndex..<prefixRange.lowerBound)
+                    }
+
+                    let payloadStart = prefixRange.upperBound
+                    guard let terminatorRange = Self.firstOSCTerminatorRange(
+                        in: shellIntegrationBuffer,
+                        from: payloadStart
+                    ) else {
+                        return
+                    }
+
+                    let payload = String(shellIntegrationBuffer[payloadStart..<terminatorRange.lowerBound])
+                    handleShellIntegrationPayload(payload)
+                    shellIntegrationBuffer.removeSubrange(shellIntegrationBuffer.startIndex..<terminatorRange.upperBound)
+                }
+
+                shellIntegrationBuffer = ""
+            }
+
+            private func handleShellIntegrationPayload(_ payload: String) {
+                if payload == "C" || payload.hasPrefix("C;") {
+                    handleShellCommandStarted()
+                } else if payload == "D" || payload.hasPrefix("D;") {
+                    pendingShellCommandFinished = true
+                }
+            }
+
+            private func handleShellCommandStarted() {
+                let bufferedPrompt = terminalInputBuffer
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let prompt = currentTerminalPrompt ?? (bufferedPrompt.isEmpty ? "Terminal command" : bufferedPrompt)
+                armForTerminalPrompt(prompt)
+            }
+
+            private func handleShellCommandFinished() {
+                guard currentTerminalPrompt != nil else {
+                    return
+                }
+
+                guard hasMeaningfulRawCapture || terminalOutputCharacterCount > 0 else {
+                    currentTerminalPrompt = nil
+                    setStatus(.watching, title: "Watching terminal input")
+                    return
+                }
+
+                cancelAutomaticUpdate()
+                setStatus(.queued, title: "Queued Markdown update", isTruncated: captureWasTruncated())
+                guard let queue = client?.bridge?.queue else {
+                    return
+                }
+
+                let workItem = DispatchWorkItem { [weak self] in
+                    guard let self, !self.isCancelled, self.currentTerminalPrompt != nil else {
+                        return
+                    }
+                    self.autoUpdateWorkItem = nil
+                    self.startClaudeUpdateIfPossible()
+                }
+                autoUpdateWorkItem = workItem
+                queue.asyncAfter(deadline: .now() + commandFinishedUpdateDelay, execute: workItem)
+            }
+
+            private func finishPendingShellCommandIfNeeded() {
+                guard pendingShellCommandFinished else {
+                    return
+                }
+
+                pendingShellCommandFinished = false
+                handleShellCommandFinished()
+            }
+
             /// Runs the Markdown update automatically once terminal output for the current command has been
             /// idle for `autoUpdateIdleDelay` — i.e. the command appears to have finished — so terminal
             /// activity is reflected in the stream without a manual press. The manual trigger still works.
@@ -1612,6 +1847,7 @@ private extension TerminalRemoteBridge {
                     return
                 }
 
+                setStatus(.queued, title: "Queued Markdown update", isTruncated: captureWasTruncated())
                 autoUpdateWorkItem?.cancel()
                 let workItem = DispatchWorkItem { [weak self] in
                     guard let self else {
@@ -1647,19 +1883,23 @@ private extension TerminalRemoteBridge {
 
                 guard !isClaudeRunning else {
                     needsFollowUpRun = true
+                    setStatus(.queued, title: "Queued Markdown update", isTruncated: captureWasTruncated())
                     return
                 }
 
                 let terminalDelta = currentTerminalDelta()
+                let wasTruncated = captureWasTruncated(delta: terminalDelta)
                 cancelAutomaticUpdate()
                 terminalRawCapture.removeAll(keepingCapacity: true)
                 hasMeaningfulRawCapture = false
+                rawCaptureWasTruncated = false
+                projectedCaptureWasTruncated = false
                 terminalOutputRows.removeAll(keepingCapacity: true)
                 terminalOutputRowOrder.removeAll(keepingCapacity: true)
                 terminalOutputCharacterCount = 0
                 needsFollowUpRun = false
                 isClaudeRunning = true
-                updateStatusLine("Updating with background Claude")
+                setStatus(.running, title: "Running Markdown update", isTruncated: wasTruncated)
                 runClaudeUpdate(
                     terminalPrompt: terminalPrompt,
                     terminalDelta: terminalDelta
@@ -1861,7 +2101,7 @@ private extension TerminalRemoteBridge {
             private func handleClaudeLaunchFailure(message: String) {
                 isClaudeRunning = false
                 claudeProcess = nil
-                appendStatusBlock(status: "Claude launch failed", detail: message)
+                setStatus(.error, title: "Claude launch failed", detail: message)
                 scheduleFollowUpIfNeeded()
             }
 
@@ -1873,7 +2113,7 @@ private extension TerminalRemoteBridge {
             private func handleClaudeRewriteLaunchFailure(message: String) {
                 isClaudeRunning = false
                 claudeProcess = nil
-                appendStatusBlock(status: "Claude rewrite launch failed", detail: message)
+                setStatus(.error, title: "Claude rewrite launch failed", detail: message)
             }
 
             private func finishClaudeUpdate(
@@ -1895,17 +2135,19 @@ private extension TerminalRemoteBridge {
                 if exitCode == 0 {
                     let markdown = Self.normalizedMarkdownOutput(output)
                     guard !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                        appendStatusBlock(
-                            status: "No Markdown appended",
+                        setStatus(
+                            .watching,
+                            title: "No Markdown appended",
                             detail: "Claude finished but did not return a non-empty append entry."
                         )
                         return
                     }
                     do {
                         try appendMarkdownEntry(markdown)
-                        publishIfChanged(isActive: true, force: true)
+                        setStatus(.watching, title: "Watching terminal input", publish: false)
+                        publishIfChanged(isActive: true, force: true, updateKind: .append)
                     } catch {
-                        appendStatusBlock(status: "Markdown write failed", detail: error.localizedDescription)
+                        setStatus(.error, title: "Markdown write failed", detail: error.localizedDescription)
                     }
                     return
                 }
@@ -1913,7 +2155,7 @@ private extension TerminalRemoteBridge {
                 let stdout = (try? String(contentsOf: files.stdoutURL, encoding: .utf8)) ?? ""
                 let stderr = (try? String(contentsOf: files.stderrURL, encoding: .utf8)) ?? ""
                 let detail = Self.claudeFailureDetail(exitCode: exitCode, stdout: stdout, stderr: stderr)
-                appendStatusBlock(status: "Claude update failed", detail: detail)
+                setStatus(.error, title: "Claude update failed", detail: detail)
             }
 
             private func finishClaudeRewrite(
@@ -1934,17 +2176,19 @@ private extension TerminalRemoteBridge {
                 if exitCode == 0 {
                     let markdown = Self.normalizedMarkdownOutput(output)
                     guard !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                        appendStatusBlock(
-                            status: "No Markdown replacement",
+                        setStatus(
+                            .watching,
+                            title: "No Markdown replacement",
                             detail: "Claude finished but did not return a non-empty Markdown file."
                         )
                         return
                     }
                     do {
                         try replaceMarkdownDocument(markdown)
-                        publishIfChanged(isActive: true, force: true)
+                        setStatus(.watching, title: "Watching terminal input", publish: false)
+                        publishIfChanged(isActive: true, force: true, updateKind: .replace)
                     } catch {
-                        appendStatusBlock(status: "Markdown rewrite failed", detail: error.localizedDescription)
+                        setStatus(.error, title: "Markdown rewrite failed", detail: error.localizedDescription)
                     }
                     return
                 }
@@ -1952,7 +2196,7 @@ private extension TerminalRemoteBridge {
                 let stdout = (try? String(contentsOf: files.stdoutURL, encoding: .utf8)) ?? ""
                 let stderr = (try? String(contentsOf: files.stderrURL, encoding: .utf8)) ?? ""
                 let detail = Self.claudeFailureDetail(exitCode: exitCode, stdout: stdout, stderr: stderr)
-                appendStatusBlock(status: "Claude rewrite failed", detail: detail)
+                setStatus(.error, title: "Claude rewrite failed", detail: detail)
             }
 
             private func scheduleFollowUpIfNeeded() {
@@ -1964,12 +2208,12 @@ private extension TerminalRemoteBridge {
                     || terminalOutputCharacterCount > 0
                 guard needsFollowUpRun || hasBufferedOutput else {
                     currentTerminalPrompt = nil
-                    updateStatusLine("Watching terminal input")
+                    setStatus(.watching, title: "Watching terminal input")
                     return
                 }
 
                 needsFollowUpRun = false
-                updateStatusLine("Capturing terminal output")
+                setStatus(.capturing, title: "Capturing terminal output", isTruncated: captureWasTruncated())
                 scheduleAutomaticUpdate()
             }
 
@@ -2093,58 +2337,54 @@ private extension TerminalRemoteBridge {
                 try markdown.write(to: fileURL, atomically: true, encoding: .utf8)
             }
 
-            private func updateStatusLine(_ status: String) {
-                let currentMarkdown = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
-                let updatedMarkdown: String
-
-                if let range = currentMarkdown.range(
-                    of: #"(?m)^\*\*Status:\*\*.*$"#,
-                    options: .regularExpression
-                ) {
-                    updatedMarkdown = currentMarkdown.replacingCharacters(
-                        in: range,
-                        with: "**Status:** \(status)"
-                    )
-                } else {
-                    updatedMarkdown = "**Status:** \(status)\n\n\(currentMarkdown)"
+            private func setStatus(
+                _ phase: TerminalRemoteProtocol.MarkdownStreamPhase,
+                title: String,
+                detail: String? = nil,
+                isTruncated: Bool? = nil,
+                publishActive: Bool = true,
+                publish: Bool = true,
+                force: Bool = false
+            ) {
+                let cappedDetail = detail.map { Self.cappedSuffix($0, limit: maxStatusDetailCharacters) }
+                let status = TerminalRemoteProtocol.MarkdownStreamStatus(
+                    phase: phase,
+                    title: title,
+                    detail: cappedDetail,
+                    isTruncated: isTruncated
+                )
+                guard force || status != streamStatus else {
+                    return
                 }
 
-                try? updatedMarkdown.write(to: fileURL, atomically: true, encoding: .utf8)
-                publishIfChanged(isActive: true, force: true)
+                streamStatus = status
+                if publish {
+                    publishIfChanged(isActive: publishActive, force: true, updateKind: .status)
+                }
             }
 
-            private func appendStatusBlock(status: String, detail: String) {
-                let currentMarkdown = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
-                let cappedDetail = Self.cappedSuffix(detail, limit: maxStatusDetailCharacters)
-                let escapedDetail = cappedDetail.replacingOccurrences(of: "```", with: "` ` `")
-                let block = """
-
-                ---
-
-                **Status:** \(status)
-
-                ```text
-                \(escapedDetail)
-                ```
-
-                """
-
-                try? (currentMarkdown + block).write(to: fileURL, atomically: true, encoding: .utf8)
-                publishIfChanged(isActive: true, force: true)
-            }
-
-            private func publishIfChanged(isActive: Bool, force: Bool = false) {
+            private func publishIfChanged(
+                isActive: Bool,
+                force: Bool = false,
+                updateKind: TerminalRemoteProtocol.MarkdownStreamUpdateKind = .snapshot
+            ) {
                 let signature = fileSignature()
                 guard force || signature != lastSignature else {
                     return
                 }
 
+                if force || signature != lastSignature {
+                    revision += 1
+                }
                 lastSignature = signature
                 client?.sendMarkdownStreamSnapshot(
                     streamID: streamID,
                     sessionID: sessionID,
                     fileURL: fileURL,
-                    isActive: isActive
+                    isActive: isActive,
+                    revision: revision,
+                    updateKind: updateKind,
+                    status: streamStatus
                 )
             }
 
@@ -2270,6 +2510,27 @@ private extension TerminalRemoteBridge {
                 data.withUnsafeBytes { rawBuffer in
                     let bytes = rawBuffer.bindMemory(to: UInt8.self)
                     return String(decoding: bytes, as: UTF8.self)
+                }
+            }
+
+            private static func firstOSCTerminatorRange(
+                in text: String,
+                from startIndex: String.Index
+            ) -> Range<String.Index>? {
+                let bell = "\u{0007}"
+                let stringTerminator = "\u{001B}\\"
+                let bellRange = text.range(of: bell, range: startIndex..<text.endIndex)
+                let stRange = text.range(of: stringTerminator, range: startIndex..<text.endIndex)
+
+                switch (bellRange, stRange) {
+                case (.some(let bellRange), .some(let stRange)):
+                    return bellRange.lowerBound < stRange.lowerBound ? bellRange : stRange
+                case (.some(let bellRange), .none):
+                    return bellRange
+                case (.none, .some(let stRange)):
+                    return stRange
+                case (.none, .none):
+                    return nil
                 }
             }
 

@@ -47,6 +47,7 @@ fi
 builtin autoload -Uz add-zsh-hook
 
 __codeedit_preexec() {
+    builtin printf "\033]133;C\007"
     builtin printf "\033]0;%s\007" "$1"
 }
 
@@ -55,6 +56,8 @@ __codeedit_update_cwd() {
 }
 
 __codeedit_precmd() {
+    local __codeedit_status="$?"
+    builtin printf "\033]133;D;%s\007" "$__codeedit_status"
     builtin printf "\033]0;zsh\007"
     __codeedit_update_cwd
 }

@@ -55,7 +55,7 @@ struct UtilityAreaDebugView: View {
                             Spacer(minLength: 0).frame(minHeight: 0)
 
                             TaskOutputView(activeTask: activeTask)
-                                .frame(height: max(0, constrainedHeight - 1))
+                                .frame(height: max(0, constrainedHeight))
                                 .id(activeTask.task.id)
                                 .padding(.horizontal, 10)
                         }
@@ -141,7 +141,7 @@ struct UtilityAreaDebugView: View {
         return .windowBackgroundColor
     }
 
-    /// Estimate the font's height for keeping the terminal aligned with the bottom.
+    /// Match SwiftTerm's cell height calculation so the SwiftUI frame contains full terminal rows.
     /// - Parameter nsFont: The font being used in the terminal.
     /// - Returns: The height in pixels of the font.
     private func fontTotalHeight(nsFont: NSFont) -> CGFloat {
@@ -149,6 +149,6 @@ struct UtilityAreaDebugView: View {
         let ascent = CTFontGetAscent(ctFont)
         let descent = CTFontGetDescent(ctFont)
         let leading = CTFontGetLeading(ctFont)
-        return ascent + descent + leading
+        return ceil(ascent + descent + leading)
     }
 }

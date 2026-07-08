@@ -89,7 +89,7 @@ struct UtilityAreaTerminalView: View {
         return utilityAreaViewModel.terminals.first(where: { $0.id == selectedTerminalID })
     }
 
-    /// Estimate the font's height for keeping the terminal aligned with the bottom.
+    /// Match SwiftTerm's cell height calculation so the SwiftUI frame contains full terminal rows.
     /// - Parameter nsFont: The font being used in the terminal.
     /// - Returns: The height in pixels of the font.
     func fontTotalHeight(nsFont: NSFont) -> CGFloat {
@@ -97,7 +97,7 @@ struct UtilityAreaTerminalView: View {
         let ascent = CTFontGetAscent(ctFont)
         let descent = CTFontGetDescent(ctFont)
         let leading = CTFontGetLeading(ctFont)
-        return ascent + descent + leading
+        return ceil(ascent + descent + leading)
     }
 
     var body: some View {
@@ -117,7 +117,7 @@ struct UtilityAreaTerminalView: View {
                         )
                         VStack(spacing: 0) {
                             Spacer(minLength: 0).frame(minHeight: 0)
-                            selectedTerminalView(height: max(0, constrainedHeight - 1))
+                            selectedTerminalView(height: max(0, constrainedHeight))
                         }
                     }
                 } else {

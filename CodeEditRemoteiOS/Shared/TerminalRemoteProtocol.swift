@@ -106,6 +106,42 @@ enum TerminalRemoteProtocol {
         let addresses: [String]?
         let publicAddress: String?
         let defaultPath: String?
+
+        init(
+            type: ServerMessageType,
+            version: Int? = nil,
+            authenticated: Bool? = nil,
+            sessions: [Session]? = nil,
+            sessionID: UUID? = nil,
+            data: Data? = nil,
+            path: String? = nil,
+            files: [FileItem]? = nil,
+            markdown: MarkdownDocument? = nil,
+            markdownStream: MarkdownStreamDocument? = nil,
+            projectedOutput: ProjectedOutput? = nil,
+            message: String? = nil,
+            port: UInt16? = nil,
+            addresses: [String]? = nil,
+            publicAddress: String? = nil,
+            defaultPath: String? = nil
+        ) {
+            self.type = type
+            self.version = version
+            self.authenticated = authenticated
+            self.sessions = sessions
+            self.sessionID = sessionID
+            self.data = data
+            self.path = path
+            self.files = files
+            self.markdown = markdown
+            self.markdownStream = markdownStream
+            self.projectedOutput = projectedOutput
+            self.message = message
+            self.port = port
+            self.addresses = addresses
+            self.publicAddress = publicAddress
+            self.defaultPath = defaultPath
+        }
     }
 
     enum ScreenMode: String, Codable, Equatable {
@@ -119,6 +155,20 @@ enum TerminalRemoteProtocol {
         let columns: Int?
         let terminalRows: Int?
         let rows: [ProjectedRow]
+
+        init(
+            sequence: Int,
+            screenMode: ScreenMode? = nil,
+            columns: Int? = nil,
+            terminalRows: Int? = nil,
+            rows: [ProjectedRow]
+        ) {
+            self.sequence = sequence
+            self.screenMode = screenMode
+            self.columns = columns
+            self.terminalRows = terminalRows
+            self.rows = rows
+        }
     }
 
     struct ProjectedRow: Codable, Equatable {
@@ -127,6 +177,12 @@ enum TerminalRemoteProtocol {
         /// Styled runs for this row. `nil` means the whole row uses the default color/style (the
         /// common case), in which case the renderer falls back to `text` and no extra bytes are sent.
         let spans: [ProjectedSpan]?
+
+        init(row: Int, text: String, spans: [ProjectedSpan]? = nil) {
+            self.row = row
+            self.text = text
+            self.spans = spans
+        }
     }
 
     /// A run of equally-styled characters within a `ProjectedRow`. Colors are packed `0xRRGGBB`
@@ -144,6 +200,13 @@ enum TerminalRemoteProtocol {
             case background = "b"
             case style = "s"
         }
+
+        init(text: String, foreground: Int? = nil, background: Int? = nil, style: Int? = nil) {
+            self.text = text
+            self.foreground = foreground
+            self.background = background
+            self.style = style
+        }
     }
 
     struct Session: Codable, Identifiable, Equatable {
@@ -154,6 +217,24 @@ enum TerminalRemoteProtocol {
         let isRunning: Bool
         let columns: Int?
         let rows: Int?
+
+        init(
+            id: UUID,
+            title: String,
+            currentDirectory: String?,
+            shell: String?,
+            isRunning: Bool,
+            columns: Int? = nil,
+            rows: Int? = nil
+        ) {
+            self.id = id
+            self.title = title
+            self.currentDirectory = currentDirectory
+            self.shell = shell
+            self.isRunning = isRunning
+            self.columns = columns
+            self.rows = rows
+        }
     }
 
     struct FileItem: Codable, Identifiable, Equatable {
@@ -166,12 +247,63 @@ enum TerminalRemoteProtocol {
         var id: String {
             path
         }
+
+        init(
+            name: String,
+            path: String,
+            isDirectory: Bool,
+            isMarkdown: Bool,
+            byteCount: Int64?
+        ) {
+            self.name = name
+            self.path = path
+            self.isDirectory = isDirectory
+            self.isMarkdown = isMarkdown
+            self.byteCount = byteCount
+        }
     }
 
     struct MarkdownDocument: Codable, Equatable {
         let path: String
         let name: String
         let markdown: String
+    }
+
+    enum MarkdownStreamUpdateKind: String, Codable, Equatable {
+        case snapshot
+        case append
+        case replace
+        case status
+    }
+
+    enum MarkdownStreamPhase: String, Codable, Equatable {
+        case starting
+        case watching
+        case capturing
+        case queued
+        case running
+        case rewriting
+        case stopped
+        case error
+    }
+
+    struct MarkdownStreamStatus: Codable, Equatable {
+        let phase: MarkdownStreamPhase
+        let title: String
+        let detail: String?
+        let isTruncated: Bool?
+
+        init(
+            phase: MarkdownStreamPhase,
+            title: String,
+            detail: String? = nil,
+            isTruncated: Bool? = nil
+        ) {
+            self.phase = phase
+            self.title = title
+            self.detail = detail
+            self.isTruncated = isTruncated
+        }
     }
 
     struct MarkdownStreamDocument: Codable, Equatable {
@@ -181,5 +313,30 @@ enum TerminalRemoteProtocol {
         let name: String
         let markdown: String
         let isActive: Bool
+        let revision: Int?
+        let updateKind: MarkdownStreamUpdateKind?
+        let status: MarkdownStreamStatus?
+
+        init(
+            streamID: UUID,
+            sessionID: UUID,
+            path: String,
+            name: String,
+            markdown: String,
+            isActive: Bool,
+            revision: Int? = nil,
+            updateKind: MarkdownStreamUpdateKind? = nil,
+            status: MarkdownStreamStatus? = nil
+        ) {
+            self.streamID = streamID
+            self.sessionID = sessionID
+            self.path = path
+            self.name = name
+            self.markdown = markdown
+            self.isActive = isActive
+            self.revision = revision
+            self.updateKind = updateKind
+            self.status = status
+        }
     }
 }

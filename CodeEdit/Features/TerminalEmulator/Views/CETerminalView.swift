@@ -18,11 +18,29 @@ private let terminalKillPreviousWord: [UInt8] = [0x1b, 0x7f]
 class CETerminalView: TerminalView {
     var performanceIdentifier: UUID?
     private var userIsReadingScrollback = false
+    private var isForwardingFrameToSwiftTerm = false
+    private var isSettlingAttachLayout = false
+    private var pendingAttachLayoutWorkItem: DispatchWorkItem?
+
+    func prepareForAttachmentLayout() {
+        pendingAttachLayoutWorkItem?.cancel()
+        pendingAttachLayoutWorkItem = nil
+        isSettlingAttachLayout = true
+
+        if superview != nil {
+            scheduleAttachLayoutFinalization()
+        }
+    }
 
     override func setFrameSize(_ newSize: NSSize) {
         if newSize != .zero {
-            preservingScrollPositionIfNeeded {
+            if isForwardingFrameToSwiftTerm {
                 super.setFrameSize(newSize)
+                return
+            }
+
+            preservingScrollPositionIfNeeded {
+                applyFrameThroughSwiftTerm(CGRect(origin: super.frame.origin, size: newSize))
             }
         }
     }
@@ -33,24 +51,159 @@ class CETerminalView: TerminalView {
         }
         set {
             if newValue.size != .zero {
+                if isForwardingFrameToSwiftTerm {
+                    super.setFrameOrigin(newValue.origin)
+                    super.setFrameSize(newValue.size)
+                    return
+                }
+
                 preservingScrollPositionIfNeeded {
-                    super.frame = newValue
+                    applyFrameThroughSwiftTerm(newValue)
                 }
             }
         }
     }
 
-    override func viewDidMoveToSuperview() {
-        super.viewDidMoveToSuperview()
-
-        guard let performanceIdentifier else {
+    private func applyFrameThroughSwiftTerm(_ newFrame: CGRect, allowHeightOnlyResize: Bool = true) {
+        if isSettlingAttachLayout {
+            applyFrameWithoutTerminalResize(newFrame)
+            scheduleAttachLayoutFinalization()
             return
         }
 
-        if superview == nil {
-            TerminalPerformanceLog.mark("terminal detached \(performanceIdentifier)")
+        isForwardingFrameToSwiftTerm = true
+        defer {
+            isForwardingFrameToSwiftTerm = false
+        }
+
+        if allowHeightOnlyResize, let size = projectedTerminalSize(for: newFrame.size) {
+            let widthDelta = abs(newFrame.size.width - super.frame.size.width)
+            let widthIsEffectivelyUnchanged = widthDelta < terminalCellSize().width
+            if widthIsEffectivelyUnchanged, terminal.rows != size.rows {
+                applyHeightOnlyFrame(newFrame, rows: size.rows)
+                return
+            }
+        }
+
+        super.frame = newFrame
+    }
+
+    func terminalSizeDidChange(columns: Int, rows: Int, frame: CGRect) {}
+
+    private func applyFrameWithoutTerminalResize(_ newFrame: CGRect) {
+        isForwardingFrameToSwiftTerm = true
+        defer {
+            isForwardingFrameToSwiftTerm = false
+        }
+
+        super.setFrameOrigin(newFrame.origin)
+        super.setFrameSize(newFrame.size)
+        needsDisplay = true
+    }
+
+    private func scheduleAttachLayoutFinalization() {
+        pendingAttachLayoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.finalizeAttachLayout()
+        }
+        pendingAttachLayoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80), execute: workItem)
+    }
+
+    private func finalizeAttachLayout() {
+        pendingAttachLayoutWorkItem = nil
+
+        guard terminal != nil else {
+            isSettlingAttachLayout = false
+            return
+        }
+
+        guard superview != nil else {
+            return
+        }
+
+        guard frame.size != .zero else {
+            isSettlingAttachLayout = false
+            return
+        }
+
+        isSettlingAttachLayout = false
+
+        guard let size = projectedTerminalSize(for: frame.size) else {
+            terminal.refresh(startRow: 0, endRow: max(0, terminal.rows - 1))
+            needsDisplay = true
+            return
+        }
+
+        if terminal.cols != size.columns {
+            preservingScrollPositionIfNeeded {
+                applyFrameThroughSwiftTerm(frame, allowHeightOnlyResize: false)
+            }
+        } else if terminal.rows != size.rows {
+            preservingScrollPositionIfNeeded {
+                applyHeightOnlyFrame(frame, rows: size.rows)
+            }
         } else {
-            TerminalPerformanceLog.mark("terminal attached \(performanceIdentifier)")
+            terminal.refresh(startRow: 0, endRow: max(0, terminal.rows - 1))
+            needsDisplay = true
+        }
+    }
+
+    private func applyHeightOnlyFrame(_ newFrame: CGRect, rows: Int) {
+        super.setFrameOrigin(newFrame.origin)
+        super.setFrameSize(newFrame.size)
+
+        guard terminal.rows != rows else {
+            needsDisplay = true
+            return
+        }
+
+        terminal.resize(cols: terminal.cols, rows: rows)
+        terminalSizeDidChange(columns: terminal.cols, rows: terminal.rows, frame: newFrame)
+        terminal.refresh(startRow: 0, endRow: max(0, terminal.rows - 1))
+        needsDisplay = true
+    }
+
+    private func projectedTerminalSize(for size: CGSize) -> (columns: Int, rows: Int)? {
+        guard terminal != nil, size.width > 0, size.height > 0 else {
+            return nil
+        }
+
+        let cellSize = terminalCellSize()
+        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        let effectiveWidth = max(0, size.width - scrollerWidth)
+        return (
+            columns: max(2, Int(effectiveWidth / cellSize.width)),
+            rows: max(1, Int(size.height / cellSize.height))
+        )
+    }
+
+    private func terminalCellSize() -> CGSize {
+        let ctFont = font as CTFont
+        let lineAscent = CTFontGetAscent(ctFont)
+        let lineDescent = CTFontGetDescent(ctFont)
+        let lineLeading = CTFontGetLeading(ctFont)
+        let cellHeight = ceil(lineAscent + lineDescent + lineLeading)
+        let glyph = font.glyph(withName: "W")
+        let cellWidth = font.advancement(forGlyph: glyph).width
+        return CGSize(width: max(1, cellWidth), height: max(1, min(cellHeight, 8192)))
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+
+        if superview == nil {
+            pendingAttachLayoutWorkItem?.cancel()
+            pendingAttachLayoutWorkItem = nil
+            isSettlingAttachLayout = false
+            if let performanceIdentifier {
+                TerminalPerformanceLog.mark("terminal detached \(performanceIdentifier)")
+            }
+        } else {
+            if let performanceIdentifier {
+                TerminalPerformanceLog.mark("terminal attached \(performanceIdentifier)")
+            }
+            prepareForAttachmentLayout()
         }
     }
 
@@ -95,7 +248,11 @@ class CETerminalView: TerminalView {
     }
 
     func updateScrollbackReadingState(position: Double) {
-        userIsReadingScrollback = position < terminalFollowScrollThreshold
+        if !canScroll || position >= terminalFollowScrollThreshold {
+            userIsReadingScrollback = false
+        } else if NSApp.currentEvent?.type == .scrollWheel {
+            userIsReadingScrollback = true
+        }
     }
 
     func handleDeleteShortcut(_ event: NSEvent) -> Bool {

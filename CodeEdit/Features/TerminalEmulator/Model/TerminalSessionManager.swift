@@ -602,7 +602,7 @@ final class TerminalSessionManager {
             return
         }
 
-        session.view.resize(cols: columns, rows: rows)
+        session.view.resizeFromRemote(columns: columns, rows: rows)
     }
 
     func recentProjectedOutput(for id: UUID) -> TerminalProjectedOutput? {

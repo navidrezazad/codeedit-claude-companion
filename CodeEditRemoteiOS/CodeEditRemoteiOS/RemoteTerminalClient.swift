@@ -9,10 +9,7 @@ import Foundation
 import Network
 import UIKit
 
-private enum CommandTranscriptSize {
-    static let columns = 140
-    static let rows = 50
-}
+// swiftlint:disable file_length
 
 private enum DefaultsKey {
     static let passcode = "CodeEditRemote.passcode"
@@ -23,6 +20,62 @@ private enum DefaultsKey {
     static let globalHost = "CodeEditRemote.globalHost"
     static let globalPort = "CodeEditRemote.globalPort"
     static let lastMarkdownDocument = "CodeEditRemote.lastMarkdownDocument"
+    static let lastMarkdownStreamState = "CodeEditRemote.lastMarkdownStreamState"
+    static let lastSelectedSessionID = "CodeEditRemote.lastSelectedSessionID"
+}
+
+private struct PersistedMarkdownStreamState: Codable {
+    let streamID: UUID
+    let sessionID: UUID
+    let path: String
+    let name: String
+    let markdown: String
+    let isTruncated: Bool
+
+    init(
+        streamID: UUID,
+        sessionID: UUID,
+        path: String,
+        name: String,
+        markdown: String,
+        isTruncated: Bool
+    ) {
+        self.streamID = streamID
+        self.sessionID = sessionID
+        self.path = path
+        self.name = name
+        self.markdown = markdown
+        self.isTruncated = isTruncated
+    }
+
+    init(document: TerminalRemoteProtocol.MarkdownStreamDocument, markdown: String? = nil) {
+        self.init(
+            streamID: document.streamID,
+            sessionID: document.sessionID,
+            path: document.path,
+            name: document.name,
+            markdown: markdown ?? document.markdown,
+            isTruncated: document.status?.isTruncated == true
+        )
+    }
+
+    var document: TerminalRemoteProtocol.MarkdownStreamDocument {
+        TerminalRemoteProtocol.MarkdownStreamDocument(
+            streamID: streamID,
+            sessionID: sessionID,
+            path: path,
+            name: name,
+            markdown: markdown,
+            isActive: false,
+            updateKind: .snapshot,
+            status: .init(
+                phase: .stopped,
+                title: "Markdown stream paused",
+                detail: "Reconnect to the Mac to resume this terminal stream.",
+                isTruncated: isTruncated
+            )
+        )
+    }
 }
 
 // swiftlint:disable:next type_body_length
@@ -86,9 +139,17 @@ final class RemoteTerminalClient: ObservableObject {
     @Published var isConnected = false
     @Published var isAuthenticated = false
     @Published var terminalMirrorSnapshot = TerminalMirrorSnapshot.empty
-    @Published var markdownStreamDocument: TerminalRemoteProtocol.MarkdownStreamDocument?
-    @Published var markdownStreamStatus = "No Markdown stream"
+    @Published var markdownStreamDocument = RemoteTerminalClient.persistedMarkdownStreamDocumentAtLaunch
+    @Published var markdownStreamStatus = RemoteTerminalClient.persistedMarkdownStreamDocumentAtLaunch == nil
+        ? "No Markdown stream"
+        : "Markdown stream paused"
+    @Published var markdownStreamStatusDetail: String? = RemoteTerminalClient.persistedMarkdownStreamDocumentAtLaunch == nil
+        ? nil
+        : "Reconnect to the Mac to resume this terminal stream."
+    @Published var markdownStreamIsTruncated = RemoteTerminalClient.persistedMarkdownStreamDocumentAtLaunch?.status?.isTruncated == true
     @Published var markdownStreamIsActive = false
+
+    private static let persistedMarkdownStreamDocumentAtLaunch = loadPersistedMarkdownStreamDocument()
 
     private let queue = DispatchQueue(label: "app.codeedit.remote-terminal-client")
     private let encoder = JSONEncoder()
@@ -101,6 +162,9 @@ final class RemoteTerminalClient: ObservableObject {
     private var projectedOutputFlushWorkItem: DispatchWorkItem?
     private var shouldRememberEndpointFromHello = false
     private var activeMarkdownStreamID: UUID?
+    private var lastMarkdownStreamRevision: Int?
+    private var requestedStoppedMarkdownStreamIDs = Set<UUID>()
+    private var pendingMarkdownStreamHandshakeIDs = Set<UUID>()
     private var connectionInFlight = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
@@ -358,9 +422,10 @@ final class RemoteTerminalClient: ObservableObject {
 
     func attach(to session: TerminalRemoteProtocol.Session) {
         selectedSessionID = session.id
+        rememberSelectedSession(session.id)
         resetTerminalPresentation()
         send(.init(type: .attach, sessionID: session.id, includeRecent: true))
-        resizeTerminal(columns: CommandTranscriptSize.columns, rows: CommandTranscriptSize.rows)
+        ensureAutomaticMarkdownStream()
     }
 
     func open(_ file: TerminalRemoteProtocol.FileItem) {
@@ -485,8 +550,13 @@ final class RemoteTerminalClient: ObservableObject {
             }
         case .sessions:
             sessions = message.sessions ?? []
-            if selectedSessionID == nil, let first = sessions.first {
-                attach(to: first)
+            if selectedSessionID == nil {
+                if let persistedSessionID = Self.loadPersistedSelectedSessionID(),
+                   let persistedSession = sessions.first(where: { $0.id == persistedSessionID }) {
+                    attach(to: persistedSession)
+                } else if let first = sessions.first {
+                    attach(to: first)
+                }
             }
         case .input:
             guard message.sessionID == selectedSessionID else {
@@ -516,6 +586,7 @@ final class RemoteTerminalClient: ObservableObject {
 
 private extension RemoteTerminalClient {
     static let maxPersistedMarkdownByteCount = 4 * 1024 * 1024
+    static let maxPersistedMarkdownStreamByteCount = 4 * 1024 * 1024
 
     /// Loads the last-opened Markdown document persisted by `persistMarkdownDocument(_:)`, if any.
     static func loadPersistedMarkdownDocument() -> TerminalRemoteProtocol.MarkdownDocument? {
@@ -537,10 +608,67 @@ private extension RemoteTerminalClient {
 
         guard let data = try? JSONEncoder().encode(document),
               data.count <= Self.maxPersistedMarkdownByteCount else {
+            UserDefaults.standard.removeObject(forKey: DefaultsKey.lastMarkdownDocument)
             return
         }
 
         UserDefaults.standard.set(data, forKey: DefaultsKey.lastMarkdownDocument)
+    }
+
+    static func loadPersistedSelectedSessionID() -> UUID? {
+        guard let value = UserDefaults.standard.string(forKey: DefaultsKey.lastSelectedSessionID) else {
+            return nil
+        }
+
+        return UUID(uuidString: value)
+    }
+
+    func rememberSelectedSession(_ sessionID: UUID) {
+        UserDefaults.standard.set(sessionID.uuidString, forKey: DefaultsKey.lastSelectedSessionID)
+    }
+
+    static func loadPersistedMarkdownStreamState() -> PersistedMarkdownStreamState? {
+        guard let data = UserDefaults.standard.data(forKey: DefaultsKey.lastMarkdownStreamState) else {
+            return nil
+        }
+
+        return try? JSONDecoder().decode(PersistedMarkdownStreamState.self, from: data)
+    }
+
+    static func loadPersistedMarkdownStreamDocument() -> TerminalRemoteProtocol.MarkdownStreamDocument? {
+        loadPersistedMarkdownStreamState()?.document
+    }
+
+    func persistedMarkdownStreamState(for sessionID: UUID) -> PersistedMarkdownStreamState? {
+        guard let state = Self.loadPersistedMarkdownStreamState(),
+              state.sessionID == sessionID else {
+            return nil
+        }
+
+        return state
+    }
+
+    func persistMarkdownStreamState(_ document: TerminalRemoteProtocol.MarkdownStreamDocument) {
+        guard document.isActive else {
+            clearPersistedMarkdownStreamState()
+            return
+        }
+
+        let fullState = PersistedMarkdownStreamState(document: document)
+        if let data = try? JSONEncoder().encode(fullState),
+           data.count <= Self.maxPersistedMarkdownStreamByteCount {
+            UserDefaults.standard.set(data, forKey: DefaultsKey.lastMarkdownStreamState)
+            return
+        }
+
+        let metadataOnlyState = PersistedMarkdownStreamState(document: document, markdown: "")
+        if let data = try? JSONEncoder().encode(metadataOnlyState) {
+            UserDefaults.standard.set(data, forKey: DefaultsKey.lastMarkdownStreamState)
+        }
+    }
+
+    func clearPersistedMarkdownStreamState() {
+        UserDefaults.standard.removeObject(forKey: DefaultsKey.lastMarkdownStreamState)
     }
 }
 
@@ -559,30 +687,65 @@ extension RemoteTerminalClient {
 
         if markdownStreamIsActive,
            markdownStreamDocument?.sessionID == selectedSessionID {
+            if let activeMarkdownStreamID,
+               pendingMarkdownStreamHandshakeIDs.contains(activeMarkdownStreamID) {
+                let resumePath = persistedMarkdownStreamState(for: selectedSessionID)?.path
+                sendMarkdownStreamStart(
+                    streamID: activeMarkdownStreamID,
+                    sessionID: selectedSessionID,
+                    resumePath: resumePath
+                )
+                return true
+            }
+
             if markdownStreamDocument?.path.isEmpty == false {
                 return true
             }
 
             if let activeMarkdownStreamID {
-                sendMarkdownStreamStart(streamID: activeMarkdownStreamID, sessionID: selectedSessionID)
+                let resumePath = persistedMarkdownStreamState(for: selectedSessionID)?.path
+                sendMarkdownStreamStart(
+                    streamID: activeMarkdownStreamID,
+                    sessionID: selectedSessionID,
+                    resumePath: resumePath
+                )
             }
             return true
         }
 
-        let streamID = UUID()
+        let persistedState = persistedMarkdownStreamState(for: selectedSessionID)
+        let streamID = persistedState?.streamID ?? UUID()
+        let resumePath = persistedState?.path
         activeMarkdownStreamID = streamID
+        lastMarkdownStreamRevision = nil
+        pendingMarkdownStreamHandshakeIDs.insert(streamID)
         markdownStreamIsActive = true
-        markdownStreamStatus = "Starting automatic Markdown stream"
-        markdownStreamDocument = TerminalRemoteProtocol.MarkdownStreamDocument(
+        markdownStreamStatus = persistedState == nil
+            ? "Starting automatic Markdown stream"
+            : "Resuming Markdown stream"
+        markdownStreamStatusDetail = persistedState == nil
+            ? nil
+            : "Reopening the previous stream file for this terminal session."
+        markdownStreamIsTruncated = persistedState?.isTruncated == true
+
+        let document = TerminalRemoteProtocol.MarkdownStreamDocument(
             streamID: streamID,
             sessionID: selectedSessionID,
-            path: "",
-            name: "Markdown Stream",
-            markdown: "",
-            isActive: true
+            path: persistedState?.path ?? "",
+            name: persistedState?.name ?? "Markdown Stream",
+            markdown: persistedState?.markdown ?? "",
+            isActive: true,
+            status: .init(
+                phase: .starting,
+                title: markdownStreamStatus,
+                detail: markdownStreamStatusDetail,
+                isTruncated: markdownStreamIsTruncated
+            )
         )
-        scheduleMarkdownStreamHandshakeTimeout(streamID: streamID)
-        sendMarkdownStreamStart(streamID: streamID, sessionID: selectedSessionID)
+        markdownStreamDocument = document
+        persistMarkdownStreamState(document)
+        scheduleMarkdownStreamHandshakeTimeout(streamID: streamID, resumePath: resumePath)
+        sendMarkdownStreamStart(streamID: streamID, sessionID: selectedSessionID, resumePath: resumePath)
         return true
     }
 
@@ -591,6 +754,8 @@ extension RemoteTerminalClient {
             return
         }
 
+        requestedStoppedMarkdownStreamIDs.insert(activeMarkdownStreamID)
+        clearPersistedMarkdownStreamState()
         markdownStreamStatus = "Stopping Markdown stream"
         send(.init(type: .stopMarkdownStream, streamID: activeMarkdownStreamID))
     }
@@ -627,21 +792,26 @@ extension RemoteTerminalClient {
         ))
     }
 
-    private func sendMarkdownStreamStart(streamID: UUID, sessionID: UUID) {
+    private func sendMarkdownStreamStart(streamID: UUID, sessionID: UUID, resumePath: String? = nil) {
         send(.init(
             type: .startMarkdownStream,
             sessionID: sessionID,
+            path: resumePath?.isEmpty == false ? resumePath : nil,
             prompt: Self.automaticMarkdownStreamPrompt,
             streamID: streamID
         ))
     }
 
-    private func scheduleMarkdownStreamHandshakeTimeout(streamID: UUID, shouldRetry: Bool = true) {
+    private func scheduleMarkdownStreamHandshakeTimeout(
+        streamID: UUID,
+        resumePath: String?,
+        shouldRetry: Bool = true
+    ) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
             guard
                 let self,
                 self.activeMarkdownStreamID == streamID,
-                self.markdownStreamDocument?.path.isEmpty != false
+                self.pendingMarkdownStreamHandshakeIDs.contains(streamID)
             else {
                 return
             }
@@ -651,27 +821,34 @@ extension RemoteTerminalClient {
                 self.markdownStreamDocument = TerminalRemoteProtocol.MarkdownStreamDocument(
                     streamID: streamID,
                     sessionID: selectedSessionID,
-                    path: "",
-                    name: "Markdown Stream",
-                    markdown: "",
+                    path: self.markdownStreamDocument?.path ?? "",
+                    name: self.markdownStreamDocument?.name ?? "Markdown Stream",
+                    markdown: self.markdownStreamDocument?.markdown ?? "",
                     isActive: true
                 )
-                self.sendMarkdownStreamStart(streamID: streamID, sessionID: selectedSessionID)
-                self.scheduleMarkdownStreamHandshakeTimeout(streamID: streamID, shouldRetry: false)
+                self.sendMarkdownStreamStart(streamID: streamID, sessionID: selectedSessionID, resumePath: resumePath)
+                self.scheduleMarkdownStreamHandshakeTimeout(
+                    streamID: streamID,
+                    resumePath: resumePath,
+                    shouldRetry: false
+                )
                 return
             }
 
             self.markdownStreamStatus = "Waiting for Mac stream"
+            self.markdownStreamStatusDetail = "The Mac did not acknowledge the Markdown stream start request."
+            self.markdownStreamIsTruncated = false
             self.markdownStreamDocument = TerminalRemoteProtocol.MarkdownStreamDocument(
                 streamID: streamID,
                 sessionID: self.selectedSessionID ?? UUID(),
-                path: "",
-                name: "Markdown Stream",
-                markdown: "",
+                path: self.markdownStreamDocument?.path ?? "",
+                name: self.markdownStreamDocument?.name ?? "Markdown Stream",
+                markdown: self.markdownStreamDocument?.markdown ?? "",
                 isActive: false
             )
             self.markdownStreamIsActive = false
             self.activeMarkdownStreamID = nil
+            self.pendingMarkdownStreamHandshakeIDs.remove(streamID)
         }
     }
 
@@ -681,6 +858,8 @@ extension RemoteTerminalClient {
         }
 
         markdownStreamStatus = message
+        markdownStreamStatusDetail = nil
+        markdownStreamIsTruncated = false
         markdownStreamDocument = TerminalRemoteProtocol.MarkdownStreamDocument(
             streamID: document.streamID,
             sessionID: document.sessionID,
@@ -691,6 +870,7 @@ extension RemoteTerminalClient {
         )
         markdownStreamIsActive = false
         activeMarkdownStreamID = nil
+        pendingMarkdownStreamHandshakeIDs.remove(document.streamID)
     }
 }
 
@@ -703,7 +883,11 @@ private extension RemoteTerminalClient {
         activeMarkdownStreamID = nil
         markdownStreamDocument = nil
         markdownStreamStatus = "No Markdown stream"
+        markdownStreamStatusDetail = nil
+        markdownStreamIsTruncated = false
         markdownStreamIsActive = false
+        lastMarkdownStreamRevision = nil
+        pendingMarkdownStreamHandshakeIDs.removeAll()
     }
 
     private func recordTerminalOutput(_ projectedOutput: TerminalRemoteProtocol.ProjectedOutput) {
@@ -774,18 +958,40 @@ private extension RemoteTerminalClient {
 
         if activeMarkdownStreamID == nil {
             activeMarkdownStreamID = document.streamID
+            lastMarkdownStreamRevision = nil
         }
 
         guard document.streamID == activeMarkdownStreamID else {
             return
         }
 
+        if let revision = document.revision {
+            if let lastMarkdownStreamRevision, revision < lastMarkdownStreamRevision {
+                return
+            }
+            lastMarkdownStreamRevision = revision
+        }
+
+        pendingMarkdownStreamHandshakeIDs.remove(document.streamID)
         markdownStreamDocument = document
         markdownStreamIsActive = document.isActive
-        markdownStreamStatus = document.isActive ? "Streaming Markdown" : "Markdown stream stopped"
+        if let status = document.status {
+            markdownStreamStatus = status.title
+            markdownStreamStatusDetail = status.detail
+            markdownStreamIsTruncated = status.isTruncated == true
+        } else {
+            markdownStreamStatus = document.isActive ? "Streaming Markdown" : "Markdown stream stopped"
+            markdownStreamStatusDetail = nil
+            markdownStreamIsTruncated = false
+        }
 
         if !document.isActive {
+            requestedStoppedMarkdownStreamIDs.remove(document.streamID)
+            clearPersistedMarkdownStreamState()
             activeMarkdownStreamID = nil
+        } else {
+            requestedStoppedMarkdownStreamIDs.remove(document.streamID)
+            persistMarkdownStreamState(document)
         }
     }
 

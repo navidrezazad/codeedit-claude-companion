@@ -370,6 +370,8 @@ struct ContentView: View {
                 MarkdownStreamAgentView(
                     document: client.markdownStreamDocument,
                     status: client.markdownStreamStatus,
+                    statusDetail: client.markdownStreamStatusDetail,
+                    isTruncated: client.markdownStreamIsTruncated,
                     session: client.selectedSession,
                     isActive: client.markdownStreamIsActive,
                     onTrigger: client.triggerMarkdownStreamUpdate,
@@ -563,12 +565,13 @@ struct MarkdownWebView: UIViewRepresentable {
             || context.coordinator.loadedMathSupport != needsMath
         else {
             if scrollsToBottom {
-                context.coordinator.scrollToBottom(in: webView)
+                context.coordinator.scrollToBottomIfFollowing(in: webView)
             }
             return
         }
 
         let source = Self.javascriptStringLiteral(markdown)
+        let renderID = context.coordinator.nextRenderID()
         context.coordinator.renderedMarkdown = markdown
 
         guard context.coordinator.hasLoadedInitialDocument,
@@ -580,7 +583,8 @@ struct MarkdownWebView: UIViewRepresentable {
                 Self.htmlDocument(
                     for: markdown,
                     scrollsToBottom: scrollsToBottom,
-                    loadsMath: needsMath
+                    loadsMath: needsMath,
+                    renderID: renderID
                 ),
                 baseURL: nil
             )
@@ -588,9 +592,12 @@ struct MarkdownWebView: UIViewRepresentable {
         }
 
         let script = """
-        window.currentMarkdown = \(source);
-        if (window.renderMarkdown) {
-          window.renderMarkdown(window.currentMarkdown, \(scrollsToBottom ? "true" : "false"));
+        if (!window.latestMarkdownRenderID || \(renderID) >= window.latestMarkdownRenderID) {
+          window.latestMarkdownRenderID = \(renderID);
+          window.currentMarkdown = \(source);
+          if (window.renderMarkdown) {
+            window.renderMarkdown(window.currentMarkdown, \(scrollsToBottom ? "true" : "false"), \(renderID));
+          }
         }
         """
         webView.evaluateJavaScript(script) { _, error in
@@ -599,7 +606,8 @@ struct MarkdownWebView: UIViewRepresentable {
                     Self.htmlDocument(
                         for: markdown,
                         scrollsToBottom: scrollsToBottom,
-                        loadsMath: needsMath
+                        loadsMath: needsMath,
+                        renderID: renderID
                     ),
                     baseURL: nil
                 )
@@ -611,7 +619,8 @@ struct MarkdownWebView: UIViewRepresentable {
     private static func htmlDocument(
         for markdown: String,
         scrollsToBottom: Bool,
-        loadsMath: Bool
+        loadsMath: Bool,
+        renderID: Int = 0
     ) -> String {
         let source = javascriptStringLiteral(markdown)
         let shouldScrollToBottom = scrollsToBottom ? "true" : "false"
@@ -622,7 +631,7 @@ struct MarkdownWebView: UIViewRepresentable {
         \(markdownDocumentHead(loadsMath: loadsMath))
         <body>
           <article id="content"></article>
-          \(markdownRuntimeScript(source: source, shouldScrollToBottom: shouldScrollToBottom))
+          \(markdownRuntimeScript(source: source, shouldScrollToBottom: shouldScrollToBottom, renderID: renderID))
         </body>
         </html>
         """
@@ -712,11 +721,17 @@ struct MarkdownWebView: UIViewRepresentable {
     }
 
     // swiftlint:disable:next function_body_length
-    private static func markdownRuntimeScript(source: String, shouldScrollToBottom: String) -> String {
+    private static func markdownRuntimeScript(
+        source: String,
+        shouldScrollToBottom: String,
+        renderID: Int
+    ) -> String {
         """
         <script>
+        window.latestMarkdownRenderID = \(renderID);
         window.currentMarkdown = \(source);
         window.shouldScrollMarkdownToBottom = \(shouldScrollToBottom);
+        window.markdownAutoFollow = true;
         const content = document.getElementById('content');
 
         function escapeHTML(value) {
@@ -921,7 +936,8 @@ struct MarkdownWebView: UIViewRepresentable {
             return katex.renderToString(entry.value, {
               displayMode: entry.kind === 'display',
               throwOnError: false,
-              strict: 'ignore'
+              strict: 'ignore',
+              trust: false
             });
           }
 
@@ -941,7 +957,18 @@ struct MarkdownWebView: UIViewRepresentable {
           return restored;
         }
 
+        function isNearMarkdownBottom() {
+          const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+          const viewportBottom = window.scrollY + window.innerHeight;
+          return height - viewportBottom < 96;
+        }
+
+        window.addEventListener('scroll', () => {
+          window.markdownAutoFollow = isNearMarkdownBottom();
+        }, { passive: true });
+
         window.scrollMarkdownToBottom = function() {
+          window.markdownAutoFollow = true;
           requestAnimationFrame(() => {
             requestAnimationFrame(() => {
               const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
@@ -950,7 +977,18 @@ struct MarkdownWebView: UIViewRepresentable {
           });
         }
 
-        window.renderMarkdown = function(source, scrollToBottom = false) {
+        window.scrollMarkdownToBottomIfFollowing = function() {
+          if (window.markdownAutoFollow !== false) {
+            window.scrollMarkdownToBottom();
+          }
+        }
+
+        window.renderMarkdown = function(source, scrollToBottom = false, renderID = 0) {
+          if (renderID < window.latestMarkdownRenderID) {
+            return;
+          }
+          window.latestMarkdownRenderID = renderID;
+          const shouldFollowBottom = scrollToBottom && window.markdownAutoFollow !== false;
           const protectedSource = protectMath(source);
           let html = '';
 
@@ -961,20 +999,24 @@ struct MarkdownWebView: UIViewRepresentable {
             html = '<pre>' + escapeHTML(protectedSource.markdown) + '</pre>';
           }
 
+          const sanitizeOptions = {
+            ADD_ATTR: ['target', 'rel'],
+            ALLOW_DATA_ATTR: false
+          };
           const sanitized = window.DOMPurify
-            ? DOMPurify.sanitize(html, {
-                ADD_ATTR: ['target', 'rel'],
-                ALLOW_DATA_ATTR: false
-              })
-            : html;
-          content.innerHTML = restoreMath(sanitized, protectedSource.math);
+            ? DOMPurify.sanitize(html, sanitizeOptions)
+            : '<pre>' + escapeHTML(protectedSource.markdown) + '</pre>';
+          const restored = restoreMath(sanitized, protectedSource.math);
+          content.innerHTML = window.DOMPurify
+            ? DOMPurify.sanitize(restored, sanitizeOptions)
+            : sanitized;
           content.querySelectorAll('a[href]').forEach((anchor) => {
             anchor.target = '_blank';
             anchor.rel = 'noopener noreferrer';
           });
 
           const finish = () => {
-            if (scrollToBottom) {
+            if (shouldFollowBottom) {
               window.scrollMarkdownToBottom();
             }
           };
@@ -982,7 +1024,7 @@ struct MarkdownWebView: UIViewRepresentable {
           requestAnimationFrame(finish);
         }
 
-        window.renderMarkdown(window.currentMarkdown, window.shouldScrollMarkdownToBottom);
+        window.renderMarkdown(window.currentMarkdown, window.shouldScrollMarkdownToBottom, window.latestMarkdownRenderID);
         </script>
         """
     }
@@ -1001,10 +1043,16 @@ struct MarkdownWebView: UIViewRepresentable {
         var hasLoadedInitialDocument = false
         var loadedMathSupport = false
         var scrollsToBottom = false
+        private var renderID = 0
+
+        func nextRenderID() -> Int {
+            renderID += 1
+            return renderID
+        }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             if scrollsToBottom {
-                scrollToBottom(in: webView)
+                scrollToBottomIfFollowing(in: webView)
             }
         }
 
@@ -1017,23 +1065,36 @@ struct MarkdownWebView: UIViewRepresentable {
                 return
             }
 
+            let nextID = nextRenderID()
             hasLoadedInitialDocument = true
             webView.loadHTMLString(
                 MarkdownWebView.htmlDocument(
                     for: markdown,
                     scrollsToBottom: scrollsToBottom,
-                    loadsMath: loadedMathSupport
+                    loadsMath: loadedMathSupport,
+                    renderID: nextID
                 ),
                 baseURL: nil
             )
         }
 
+        func scrollToBottomIfFollowing(in webView: WKWebView) {
+            let script = """
+            if (window.scrollMarkdownToBottomIfFollowing) {
+              window.scrollMarkdownToBottomIfFollowing();
+            } else if (window.markdownAutoFollow !== false) {
+              window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+            }
+            """
+            webView.evaluateJavaScript(script)
+        }
+
         func scrollToBottom(in webView: WKWebView) {
             let script = """
             if (window.scrollMarkdownToBottom) {
-              window.scrollMarkdownToBottom();
+                window.scrollMarkdownToBottom();
             } else {
-              window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+                window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
             }
             """
             webView.evaluateJavaScript(script)

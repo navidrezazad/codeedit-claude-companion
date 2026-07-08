@@ -269,6 +269,43 @@ enum TerminalRemoteProtocol {
         let markdown: String
     }
 
+    enum MarkdownStreamUpdateKind: String, Codable, Equatable {
+        case snapshot
+        case append
+        case replace
+        case status
+    }
+
+    enum MarkdownStreamPhase: String, Codable, Equatable {
+        case starting
+        case watching
+        case capturing
+        case queued
+        case running
+        case rewriting
+        case stopped
+        case error
+    }
+
+    struct MarkdownStreamStatus: Codable, Equatable {
+        let phase: MarkdownStreamPhase
+        let title: String
+        let detail: String?
+        let isTruncated: Bool?
+
+        init(
+            phase: MarkdownStreamPhase,
+            title: String,
+            detail: String? = nil,
+            isTruncated: Bool? = nil
+        ) {
+            self.phase = phase
+            self.title = title
+            self.detail = detail
+            self.isTruncated = isTruncated
+        }
+    }
+
     struct MarkdownStreamDocument: Codable, Equatable {
         let streamID: UUID
         let sessionID: UUID
@@ -276,6 +313,9 @@ enum TerminalRemoteProtocol {
         let name: String
         let markdown: String
         let isActive: Bool
+        let revision: Int?
+        let updateKind: MarkdownStreamUpdateKind?
+        let status: MarkdownStreamStatus?
 
         init(
             streamID: UUID,
@@ -283,7 +323,10 @@ enum TerminalRemoteProtocol {
             path: String,
             name: String,
             markdown: String,
-            isActive: Bool
+            isActive: Bool,
+            revision: Int? = nil,
+            updateKind: MarkdownStreamUpdateKind? = nil,
+            status: MarkdownStreamStatus? = nil
         ) {
             self.streamID = streamID
             self.sessionID = sessionID
@@ -291,6 +334,9 @@ enum TerminalRemoteProtocol {
             self.name = name
             self.markdown = markdown
             self.isActive = isActive
+            self.revision = revision
+            self.updateKind = updateKind
+            self.status = status
         }
     }
 }

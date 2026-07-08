@@ -10,6 +10,8 @@ import SwiftUI
 struct MarkdownStreamAgentView: View {
     let document: TerminalRemoteProtocol.MarkdownStreamDocument?
     let status: String
+    let statusDetail: String?
+    let isTruncated: Bool
     let session: TerminalRemoteProtocol.Session?
     let isActive: Bool
     let onTrigger: () -> Void
@@ -60,9 +62,24 @@ struct MarkdownStreamAgentView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+
+                if let statusDetail, !statusDetail.isEmpty {
+                    Text(statusDetail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
             }
 
             Spacer()
+
+            if isTruncated {
+                Label("Truncated", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.orange)
+                    .labelStyle(.iconOnly)
+                    .accessibilityLabel("Terminal increment was truncated")
+            }
 
             if isActive {
                 Button {
@@ -147,7 +164,7 @@ struct MarkdownStreamAgentView: View {
 
     private var subtitle: String {
         if let path = document?.path, !path.isEmpty {
-            return URL(fileURLWithPath: path).lastPathComponent
+            return "\(status) - \(URL(fileURLWithPath: path).lastPathComponent)"
         }
 
         return status

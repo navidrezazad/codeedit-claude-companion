@@ -152,13 +152,49 @@ class CELocalShellTerminalView: CETerminalView, TerminalViewDelegate, LocalProce
         if lastReportedTerminalColumns == newCols, lastReportedTerminalRows == newRows {
             return
         }
-        lastReportedTerminalColumns = newCols
-        lastReportedTerminalRows = newRows
 
-        var size = getWindowSize()
+        // Resize the pseudo-terminal on the same turn that SwiftTerm reflows its own buffer.
+        // `processSizeChange` (in SwiftTerm) already called `terminal.resize(...)` synchronously
+        // before this delegate fires, so the child process must learn the new size immediately.
+        // Deferring the SIGWINCH leaves the emulator's buffer and the child disagreeing about the
+        // row count; a bottom-anchored TUI (e.g. Claude Code) then paints its footer against the
+        // stale size and it lands outside the visible viewport until a full repaint.
+        applyTerminalResize(columns: newCols, rows: newRows)
+    }
+
+    override func terminalSizeDidChange(columns: Int, rows: Int, frame: CGRect) {
+        applyTerminalResize(columns: columns, rows: rows, pixelSize: frame.size)
+    }
+
+    func resizeFromRemote(columns: Int, rows: Int) {
+        guard process.running, columns > 0, rows > 0 else {
+            return
+        }
+
+        let terminal = getTerminal()
+        guard terminal.cols != columns || terminal.rows != rows else {
+            return
+        }
+
+        terminal.resize(cols: columns, rows: rows)
+        applyTerminalResize(columns: terminal.cols, rows: terminal.rows)
+    }
+
+    private func applyTerminalResize(columns: Int, rows: Int, pixelSize: CGSize? = nil) {
+        guard process.running, columns > 0, rows > 0 else {
+            return
+        }
+        guard lastReportedTerminalColumns != columns || lastReportedTerminalRows != rows else {
+            return
+        }
+
+        lastReportedTerminalColumns = columns
+        lastReportedTerminalRows = rows
+
+        var size = getWindowSize(columns: columns, rows: rows, pixelSize: pixelSize)
         _ = PseudoTerminalHelpers.setWinSize(masterPtyDescriptor: process.childfd, windowSize: &size)
 
-        processDelegate?.sizeChanged(source: self, newCols: newCols, newRows: newRows)
+        processDelegate?.sizeChanged(source: self, newCols: columns, newRows: rows)
     }
 
     public func clipboardCopy(source: TerminalView, content: Data) {
@@ -211,12 +247,16 @@ class CELocalShellTerminalView: CETerminalView, TerminalViewDelegate, LocalProce
 
     /// Implements the LocalProcessDelegate.getWindowSize method
     public func getWindowSize() -> winsize {
-        let frame: CGRect = self.frame
+        getWindowSize(columns: getTerminal().cols, rows: getTerminal().rows)
+    }
+
+    private func getWindowSize(columns: Int, rows: Int, pixelSize: CGSize? = nil) -> winsize {
+        let size = pixelSize ?? frame.size
         return winsize(
-            ws_row: UInt16(getTerminal().rows),
-            ws_col: UInt16(getTerminal().cols),
-            ws_xpixel: UInt16(frame.width),
-            ws_ypixel: UInt16(frame.height)
+            ws_row: UInt16(rows),
+            ws_col: UInt16(columns),
+            ws_xpixel: UInt16(size.width),
+            ws_ypixel: UInt16(size.height)
         )
     }
 }
