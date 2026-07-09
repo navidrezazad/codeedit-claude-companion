@@ -18,6 +18,7 @@
 		CE0000000000000000000055 /* purify.min.js in Resources */ = {isa = PBXBuildFile; fileRef = CE0000000000000000000060 /* purify.min.js */; };
 		CE0000000000000000000056 /* katex.min.js in Resources */ = {isa = PBXBuildFile; fileRef = CE0000000000000000000061 /* katex.min.js */; };
 		CE0000000000000000000057 /* katex.min.css in Resources */ = {isa = PBXBuildFile; fileRef = CE0000000000000000000062 /* katex.min.css */; };
+		CE0000000000000000000064 /* TerminalMirrorBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE0000000000000000000065 /* TerminalMirrorBuffer.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -34,6 +35,7 @@
 		CE0000000000000000000060 /* purify.min.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = purify.min.js; sourceTree = "<group>"; };
 		CE0000000000000000000061 /* katex.min.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = katex.min.js; sourceTree = "<group>"; };
 		CE0000000000000000000062 /* katex.min.css */ = {isa = PBXFileReference; lastKnownFileType = text.css; path = katex.min.css; sourceTree = "<group>"; };
+		CE0000000000000000000065 /* TerminalMirrorBuffer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalMirrorBuffer.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -70,6 +72,7 @@
 				CE0000000000000000000010 /* CodeEditRemoteApp.swift */,
 				CE0000000000000000000011 /* ContentView.swift */,
 				CE0000000000000000000012 /* RemoteTerminalClient.swift */,
+				CE0000000000000000000065 /* TerminalMirrorBuffer.swift */,
 				CE0000000000000000000052 /* TerminalMirrorView.swift */,
 				CE0000000000000000000050 /* MarkdownStreamAgentView.swift */,
 				CE0000000000000000000058 /* MarkdownRendererAssets.swift */,
@@ -179,6 +182,7 @@
 				CE0000000000000000000022 /* RemoteTerminalClient.swift in Sources */,
 				CE0000000000000000000049 /* MarkdownStreamAgentView.swift in Sources */,
 				CE0000000000000000000051 /* TerminalMirrorView.swift in Sources */,
+				CE0000000000000000000064 /* TerminalMirrorBuffer.swift in Sources */,
 				CE0000000000000000000053 /* MarkdownRendererAssets.swift in Sources */,
 				CE0000000000000000000023 /* TerminalRemoteProtocol.swift in Sources */,
 			);

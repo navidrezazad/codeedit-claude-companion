@@ -238,7 +238,9 @@ struct TerminalEmulatorView: NSViewRepresentable {
         terminal.getTerminal().silentLog = true
         terminal.appearance = colorAppearance
         scroller(terminal)?.isHidden = true
-        terminal.font = font
+        if terminal.font.fontName != font.fontName || abs(terminal.font.pointSize - font.pointSize) > 0.01 {
+            terminal.font = font
+        }
         terminal.installColors(self.colors)
         terminal.caretColor = cursorColor.withAlphaComponent(0.5)
         terminal.caretTextColor = cursorColor.withAlphaComponent(0.5)
@@ -251,8 +253,9 @@ struct TerminalEmulatorView: NSViewRepresentable {
         cacheConfigurationSignature(configurationSignature, for: terminalID)
 
         if forceRedraw {
-            terminal.getTerminal().softReset()
-            terminal.feed(text: "") // send empty character to force colors to be redrawn
+            let emulator = terminal.getTerminal()
+            emulator.refresh(startRow: 0, endRow: max(0, emulator.rows - 1))
+            terminal.needsDisplay = true
         }
     }
 

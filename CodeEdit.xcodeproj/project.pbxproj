@@ -690,6 +690,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = "Change in Info.plist";
 				PRODUCT_BUNDLE_IDENTIFIER = app.codeedit.CodeEditV2;
+				PRODUCT_MODULE_NAME = CodeEdit;
 				PRODUCT_NAME = CodeEditV2;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -726,7 +727,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEdit.app/Contents/MacOS/CodeEdit";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEditV2.app/Contents/MacOS/CodeEditV2";
 			};
 			name = Alpha;
 		};
@@ -892,6 +893,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = "Change in Info.plist";
 				PRODUCT_BUNDLE_IDENTIFIER = app.codeedit.CodeEditV2;
+				PRODUCT_MODULE_NAME = CodeEdit;
 				PRODUCT_NAME = CodeEditV2;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -928,7 +930,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEdit.app/Contents/MacOS/CodeEdit";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEditV2.app/Contents/MacOS/CodeEditV2";
 			};
 			name = Beta;
 		};
@@ -1166,6 +1168,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = "Change in Info.plist";
 				PRODUCT_BUNDLE_IDENTIFIER = app.codeedit.CodeEditV2;
+				PRODUCT_MODULE_NAME = CodeEdit;
 				PRODUCT_NAME = CodeEditV2;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -1202,7 +1205,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEdit.app/Contents/MacOS/CodeEdit";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEditV2.app/Contents/MacOS/CodeEditV2";
 			};
 			name = Pre;
 		};
@@ -1440,6 +1443,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = "Change in Info.plist";
 				PRODUCT_BUNDLE_IDENTIFIER = app.codeedit.CodeEditV2;
+				PRODUCT_MODULE_NAME = CodeEdit;
 				PRODUCT_NAME = CodeEditV2;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -1485,6 +1489,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = "Change in Info.plist";
 				PRODUCT_BUNDLE_IDENTIFIER = app.codeedit.CodeEditV2;
+				PRODUCT_MODULE_NAME = CodeEdit;
 				PRODUCT_NAME = CodeEditV2;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -1521,7 +1526,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEdit.app/Contents/MacOS/CodeEdit";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEditV2.app/Contents/MacOS/CodeEditV2";
 			};
 			name = Debug;
 		};
@@ -1548,7 +1553,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEdit.app/Contents/MacOS/CodeEdit";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CodeEditV2.app/Contents/MacOS/CodeEditV2";
 			};
 			name = Release;
 		};

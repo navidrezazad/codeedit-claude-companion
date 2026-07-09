@@ -8,7 +8,7 @@
 import Foundation
 
 enum TerminalRemoteProtocol {
-    static let version = 1
+    static let version = 2
     static let serviceType = "_codeeditv2-term._tcp"
 
     /// Default terminal foreground/background colors (packed 0xRRGGBB) shared by both sides so the
@@ -149,24 +149,61 @@ enum TerminalRemoteProtocol {
         case alternate
     }
 
+    enum CursorShape: String, Codable, Equatable {
+        case block
+        case underline
+        case bar
+    }
+
+    struct ProjectedCursor: Codable, Equatable {
+        let row: Int
+        let column: Int
+        let isVisible: Bool
+        let shape: CursorShape
+        let isBlinking: Bool
+
+        init(
+            row: Int,
+            column: Int,
+            isVisible: Bool,
+            shape: CursorShape,
+            isBlinking: Bool
+        ) {
+            self.row = row
+            self.column = column
+            self.isVisible = isVisible
+            self.shape = shape
+            self.isBlinking = isBlinking
+        }
+    }
+
     struct ProjectedOutput: Codable, Equatable {
         let sequence: Int
+        let generation: Int?
+        let isSnapshot: Bool?
         let screenMode: ScreenMode?
         let columns: Int?
         let terminalRows: Int?
+        let cursor: ProjectedCursor?
         let rows: [ProjectedRow]
 
         init(
             sequence: Int,
+            generation: Int? = nil,
+            isSnapshot: Bool? = nil,
             screenMode: ScreenMode? = nil,
             columns: Int? = nil,
             terminalRows: Int? = nil,
+            cursor: ProjectedCursor? = nil,
             rows: [ProjectedRow]
         ) {
             self.sequence = sequence
+            self.generation = generation
+            self.isSnapshot = isSnapshot
             self.screenMode = screenMode
             self.columns = columns
             self.terminalRows = terminalRows
+            self.cursor = cursor
             self.rows = rows
         }
     }

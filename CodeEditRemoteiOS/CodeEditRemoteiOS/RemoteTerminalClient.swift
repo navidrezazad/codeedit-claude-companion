@@ -80,6 +80,16 @@ private struct PersistedMarkdownStreamState: Codable {
 
 // swiftlint:disable:next type_body_length
 final class RemoteTerminalClient: ObservableObject {
+    private final class ConnectionContext {
+        let id = UUID()
+        let connection: NWConnection
+        var receiveBuffer = Data()
+
+        init(connection: NWConnection) {
+            self.connection = connection
+        }
+    }
+
     struct DiscoveredHost: Identifiable, Equatable {
         let id: String
         let name: String
@@ -154,10 +164,10 @@ final class RemoteTerminalClient: ObservableObject {
     private let queue = DispatchQueue(label: "app.codeedit.remote-terminal-client")
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let maxServerMessageBytes = 16 * 1024 * 1024
     private var terminalMirrorBuffer = TerminalMirrorBuffer()
     private var browser: NWBrowser?
-    private var connection: NWConnection?
-    private var receiveBuffer = Data()
+    private var connectionContext: ConnectionContext?
     private var pendingProjectedOutput: TerminalRemoteProtocol.ProjectedOutput?
     private var projectedOutputFlushWorkItem: DispatchWorkItem?
     private var shouldRememberEndpointFromHello = false
@@ -249,29 +259,36 @@ final class RemoteTerminalClient: ObservableObject {
         statusMessage = "Connecting to \(displayName)"
 
         let connection = NWConnection(to: endpoint, using: Self.keepAliveParameters())
-        self.connection = connection
+        let context = ConnectionContext(connection: connection)
+        connectionContext = context
 
-        connection.stateUpdateHandler = { [weak self] state in
-            guard let self else {
+        connection.stateUpdateHandler = { [weak self, weak context] state in
+            guard let self, let context else {
                 return
             }
 
             DispatchQueue.main.async {
+                guard self.connectionContext?.id == context.id else {
+                    return
+                }
+
                 switch state {
                 case .ready:
                     self.connectionInFlight = false
                     self.isConnected = true
                     self.statusMessage = "Connected"
-                    self.receiveNext()
+                    self.receiveNext(context)
                     if !self.passcode.isEmpty {
                         self.authenticate()
                     }
                 case .failed(let error):
+                    self.connectionContext = nil
                     self.connectionInFlight = false
                     self.statusMessage = error.localizedDescription
                     self.isConnected = false
                     self.isAuthenticated = false
                 case .cancelled:
+                    self.connectionContext = nil
                     self.connectionInFlight = false
                     self.isConnected = false
                     self.isAuthenticated = false
@@ -346,10 +363,9 @@ final class RemoteTerminalClient: ObservableObject {
     }
 
     func disconnect() {
-        connection?.cancel()
-        connection = nil
+        connectionContext?.connection.cancel()
+        connectionContext = nil
         connectionInFlight = false
-        receiveBuffer.removeAll()
         sessions.removeAll()
         selectedSessionID = nil
         resetTerminalPresentation()
@@ -421,6 +437,9 @@ final class RemoteTerminalClient: ObservableObject {
     }
 
     func attach(to session: TerminalRemoteProtocol.Session) {
+        if let previousSessionID = selectedSessionID, previousSessionID != session.id {
+            send(.init(type: .detach, sessionID: previousSessionID))
+        }
         selectedSessionID = session.id
         rememberSelectedSession(session.id)
         resetTerminalPresentation()
@@ -470,16 +489,19 @@ final class RemoteTerminalClient: ObservableObject {
     }
 
     private func send(_ message: TerminalRemoteProtocol.ClientMessage) {
-        guard let connection else {
+        guard let context = connectionContext else {
             return
         }
 
         do {
             var data = try encoder.encode(message)
             data.append(0x0a)
-            connection.send(content: data, completion: .contentProcessed { [weak self] error in
+            context.connection.send(content: data, completion: .contentProcessed { [weak self, weak context] error in
                 if let error {
                     DispatchQueue.main.async {
+                        guard let context, self?.connectionContext?.id == context.id else {
+                            return
+                        }
                         self?.statusMessage = error.localizedDescription
                     }
                 }
@@ -489,57 +511,96 @@ final class RemoteTerminalClient: ObservableObject {
         }
     }
 
-    private func receiveNext() {
-        connection?.receive(
+    private func receiveNext(_ context: ConnectionContext) {
+        context.connection.receive(
             minimumIncompleteLength: 1,
             maximumLength: 64 * 1024
-        ) { [weak self] data, _, isComplete, error in
-            guard let self else {
+        ) { [weak self, weak context] data, _, isComplete, error in
+            guard let self, let context else {
                 return
             }
 
             if let data, !data.isEmpty {
-                self.receiveBuffer.append(data)
-                self.processReceiveBuffer()
+                context.receiveBuffer.append(data)
+                guard self.processReceiveBuffer(context) else {
+                    return
+                }
             }
 
             if isComplete || error != nil {
                 DispatchQueue.main.async {
+                    guard self.connectionContext?.id == context.id else {
+                        return
+                    }
+                    self.connectionContext = nil
                     self.isConnected = false
                     self.isAuthenticated = false
                 }
                 return
             }
 
-            self.receiveNext()
+            self.receiveNext(context)
         }
     }
 
-    private func processReceiveBuffer() {
-        while let newlineIndex = receiveBuffer.firstIndex(of: 0x0a) {
-            let frame = receiveBuffer[..<newlineIndex]
-            receiveBuffer.removeSubrange(...newlineIndex)
+    private func processReceiveBuffer(_ context: ConnectionContext) -> Bool {
+        while let newlineIndex = context.receiveBuffer.firstIndex(of: 0x0a) {
+            let frame = context.receiveBuffer[..<newlineIndex]
+            context.receiveBuffer.removeSubrange(...newlineIndex)
 
             guard !frame.isEmpty else {
                 continue
             }
 
+            guard frame.count <= maxServerMessageBytes else {
+                failOversizedServerMessage(context)
+                return false
+            }
+
             do {
                 let message = try decoder.decode(TerminalRemoteProtocol.ServerMessage.self, from: Data(frame))
                 DispatchQueue.main.async {
+                    guard self.connectionContext?.id == context.id else {
+                        return
+                    }
                     self.handle(message)
                 }
             } catch {
                 DispatchQueue.main.async {
+                    guard self.connectionContext?.id == context.id else {
+                        return
+                    }
                     self.statusMessage = "Invalid server message"
                 }
             }
+        }
+
+        guard context.receiveBuffer.count <= maxServerMessageBytes else {
+            failOversizedServerMessage(context)
+            return false
+        }
+
+        return true
+    }
+
+    private func failOversizedServerMessage(_ context: ConnectionContext) {
+        DispatchQueue.main.async { [weak self] in
+            guard self?.connectionContext?.id == context.id else {
+                return
+            }
+            self?.disconnect()
+            self?.statusMessage = "Mac sent a terminal update that is too large"
         }
     }
 
     private func handle(_ message: TerminalRemoteProtocol.ServerMessage) {
         switch message.type {
         case .hello:
+            if let version = message.version, version > TerminalRemoteProtocol.version {
+                statusMessage = "Mac requires a newer CodeEdit Remote version"
+                disconnect()
+                return
+            }
             rememberDirectEndpoint(from: message)
             statusMessage = message.message ?? "Connected"
         case .authenticated:
@@ -549,7 +610,16 @@ final class RemoteTerminalClient: ObservableObject {
                 browseFiles()
             }
         case .sessions:
-            sessions = message.sessions ?? []
+            let updatedSessions = message.sessions ?? []
+            let previousSelection = selectedSessionID
+            sessions = updatedSessions
+
+            if let previousSelection,
+               !updatedSessions.contains(where: { $0.id == previousSelection }) {
+                selectedSessionID = nil
+                resetTerminalPresentation()
+            }
+
             if selectedSessionID == nil {
                 if let persistedSessionID = Self.loadPersistedSelectedSessionID(),
                    let persistedSession = sessions.first(where: { $0.id == persistedSessionID }) {
@@ -901,9 +971,32 @@ private extension RemoteTerminalClient {
             return
         }
 
+        if pendingProjectedOutput.generation == nil,
+           output.generation == nil,
+           output.sequence < pendingProjectedOutput.sequence {
+            // Protocol v1 represented resize/reflow with a sequence reset. Preserve that reset
+            // through the batching layer so TerminalMirrorBuffer can clear the old geometry.
+            self.pendingProjectedOutput = output
+            return
+        }
+
+        let pendingGeneration = pendingProjectedOutput.generation ?? 0
+        let outputGeneration = output.generation ?? pendingGeneration
+        guard outputGeneration >= pendingGeneration else {
+            return
+        }
+
+        if outputGeneration > pendingGeneration || output.isSnapshot == true {
+            self.pendingProjectedOutput = output
+            return
+        }
+
         let pendingMode = pendingProjectedOutput.screenMode
         let outputMode = output.screenMode
-        guard pendingMode == outputMode, output.sequence >= pendingProjectedOutput.sequence else {
+        guard output.sequence >= pendingProjectedOutput.sequence else {
+            return
+        }
+        guard pendingMode == outputMode else {
             self.pendingProjectedOutput = output
             return
         }
@@ -920,9 +1013,12 @@ private extension RemoteTerminalClient {
 
         self.pendingProjectedOutput = TerminalRemoteProtocol.ProjectedOutput(
             sequence: output.sequence,
+            generation: output.generation ?? pendingProjectedOutput.generation,
+            isSnapshot: pendingProjectedOutput.isSnapshot == true,
             screenMode: output.screenMode ?? pendingProjectedOutput.screenMode,
             columns: output.columns ?? pendingProjectedOutput.columns,
             terminalRows: output.terminalRows ?? pendingProjectedOutput.terminalRows,
+            cursor: output.cursor ?? pendingProjectedOutput.cursor,
             rows: rows
         )
     }

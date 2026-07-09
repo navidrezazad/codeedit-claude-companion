@@ -8,41 +8,6 @@
 import SwiftUI
 import UIKit
 
-/// A styled run of characters within a mirrored terminal row. Colors are packed `0xRRGGBB`
-/// (`nil` = terminal default); `style` is an `OR` of `TerminalRemoteProtocol.SpanStyle` bits.
-struct TerminalMirrorSegment: Equatable {
-    let text: String
-    let foreground: Int?
-    let background: Int?
-    let style: Int
-}
-
-struct TerminalMirrorRow: Identifiable, Equatable {
-    let id: Int
-    let text: String
-    let segments: [TerminalMirrorSegment]
-}
-
-struct TerminalMirrorSnapshot: Equatable {
-    var sequence: Int
-    var screenMode: TerminalRemoteProtocol.ScreenMode
-    var columns: Int
-    var terminalRows: Int
-    var rows: [TerminalMirrorRow]
-
-    static let empty = TerminalMirrorSnapshot(
-        sequence: 0,
-        screenMode: .main,
-        columns: 80,
-        terminalRows: 24,
-        rows: []
-    )
-
-    var isAlternateScreen: Bool {
-        screenMode == .alternate
-    }
-}
-
 /// Fixed dark-terminal palette so the mirror reads like a real terminal regardless of the iPhone's
 /// light/dark appearance. The default colors match `TerminalRemoteProtocol`'s shared constants.
 enum TerminalPalette {
@@ -61,146 +26,6 @@ extension Color {
     }
 }
 
-struct TerminalMirrorBuffer {
-    private struct RowContent: Equatable {
-        let text: String
-        let segments: [TerminalMirrorSegment]
-    }
-
-    private let maxMainRows = 5_000
-    private var mainRows: [Int: RowContent] = [:]
-    private var alternateRows: [Int: RowContent] = [:]
-    private var lastSequence = 0
-    private var screenMode = TerminalRemoteProtocol.ScreenMode.main
-    private var columns = 80
-    private var terminalRows = 24
-
-    mutating func reset() -> TerminalMirrorSnapshot {
-        mainRows.removeAll(keepingCapacity: true)
-        alternateRows.removeAll(keepingCapacity: true)
-        lastSequence = 0
-        screenMode = .main
-        columns = 80
-        terminalRows = 24
-        return .empty
-    }
-
-    mutating func apply(_ output: TerminalRemoteProtocol.ProjectedOutput) -> TerminalMirrorSnapshot {
-        let nextScreenMode = output.screenMode ?? screenMode
-        let nextColumns = max(1, output.columns ?? columns)
-        let nextRows = max(1, output.terminalRows ?? terminalRows)
-
-        columns = nextColumns
-        terminalRows = nextRows
-
-        switch nextScreenMode {
-        case .main:
-            ingestMain(output)
-        case .alternate:
-            ingestAlternate(output)
-        }
-
-        return snapshot()
-    }
-
-    private mutating func ingestMain(_ output: TerminalRemoteProtocol.ProjectedOutput) {
-        if screenMode == .alternate {
-            alternateRows.removeAll(keepingCapacity: true)
-        }
-        if output.sequence < lastSequence {
-            mainRows.removeAll(keepingCapacity: true)
-        }
-
-        screenMode = .main
-        lastSequence = output.sequence
-
-        for row in output.rows where row.row >= 0 {
-            mainRows[row.row] = Self.rowContent(from: row)
-        }
-
-        trimMainRowsIfNeeded()
-    }
-
-    private mutating func ingestAlternate(_ output: TerminalRemoteProtocol.ProjectedOutput) {
-        if screenMode != .alternate {
-            alternateRows.removeAll(keepingCapacity: true)
-        }
-
-        screenMode = .alternate
-        lastSequence = output.sequence
-
-        for row in output.rows where row.row >= 0 && row.row < terminalRows {
-            alternateRows[row.row] = Self.rowContent(from: row)
-        }
-    }
-
-    private mutating func trimMainRowsIfNeeded() {
-        guard mainRows.count > maxMainRows else {
-            return
-        }
-
-        for key in mainRows.keys.sorted().prefix(mainRows.count - maxMainRows) {
-            mainRows[key] = nil
-        }
-    }
-
-    private func snapshot() -> TerminalMirrorSnapshot {
-        let rows = renderedRows()
-        return TerminalMirrorSnapshot(
-            sequence: lastSequence,
-            screenMode: screenMode,
-            columns: columns,
-            terminalRows: terminalRows,
-            rows: rows
-        )
-    }
-
-    private func renderedRows() -> [TerminalMirrorRow] {
-        switch screenMode {
-        case .main:
-            return mainRows.keys.sorted().map { key in
-                let content = mainRows[key]
-                return TerminalMirrorRow(
-                    id: key,
-                    text: content?.text ?? "",
-                    segments: content?.segments ?? []
-                )
-            }
-        case .alternate:
-            guard terminalRows > 0 else {
-                return []
-            }
-            return (0..<terminalRows).map { key in
-                let content = alternateRows[key]
-                return TerminalMirrorRow(
-                    id: key,
-                    text: content?.text ?? "",
-                    segments: content?.segments ?? []
-                )
-            }
-        }
-    }
-
-    private static func rowContent(from row: TerminalRemoteProtocol.ProjectedRow) -> RowContent {
-        guard let spans = row.spans, !spans.isEmpty else {
-            return RowContent(
-                text: row.text,
-                segments: [TerminalMirrorSegment(text: row.text, foreground: nil, background: nil, style: 0)]
-            )
-        }
-
-        let segments = spans.map { span in
-            TerminalMirrorSegment(
-                text: span.text,
-                foreground: span.foreground,
-                background: span.background,
-                style: span.style ?? 0
-            )
-        }
-        return RowContent(text: row.text, segments: segments)
-    }
-}
-
 struct TerminalMirrorView: View {
     let snapshot: TerminalMirrorSnapshot
     let session: TerminalRemoteProtocol.Session?
@@ -208,9 +33,13 @@ struct TerminalMirrorView: View {
     @State private var pendingScrollWorkItem: DispatchWorkItem?
 
     private let bottomID = "terminal-mirror-bottom"
-    private let characterWidth: CGFloat = 6.9
     private let lineHeight: CGFloat = 14.5
     private let fontSize: CGFloat = 11
+
+    private var characterWidth: CGFloat {
+        let font = UIFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        return ("M" as NSString).size(withAttributes: [.font: font]).width
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -266,10 +95,7 @@ struct TerminalMirrorView: View {
                             .frame(minWidth: 320, maxWidth: .infinity, minHeight: 180)
                     } else {
                         ForEach(snapshot.rows) { row in
-                            Text(attributedRow(row))
-                                .font(.system(size: fontSize, design: .monospaced))
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
+                            terminalRow(row)
                                 .id(row.id)
                         }
                     }
@@ -292,6 +118,42 @@ struct TerminalMirrorView: View {
                 pendingScrollWorkItem?.cancel()
                 pendingScrollWorkItem = nil
             }
+        }
+    }
+
+    private func terminalRow(_ row: TerminalMirrorRow) -> some View {
+        ZStack(alignment: .leading) {
+            Text(attributedRow(row))
+                .font(.system(size: fontSize, design: .monospaced))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+
+            if let cursor = snapshot.cursor,
+               cursor.isVisible,
+               cursor.row == row.id {
+                cursorIndicator(cursor)
+                    .offset(x: CGFloat(cursor.column) * characterWidth)
+            }
+        }
+        .frame(height: lineHeight, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func cursorIndicator(_ cursor: TerminalRemoteProtocol.ProjectedCursor) -> some View {
+        switch cursor.shape {
+        case .block:
+            Rectangle()
+                .fill(Color.cyan.opacity(0.46))
+                .frame(width: characterWidth, height: lineHeight)
+        case .underline:
+            Rectangle()
+                .fill(Color.cyan.opacity(0.9))
+                .frame(width: characterWidth, height: 2)
+                .offset(y: (lineHeight / 2) - 1)
+        case .bar:
+            Rectangle()
+                .fill(Color.cyan.opacity(0.9))
+                .frame(width: 1.5, height: lineHeight)
         }
     }
 

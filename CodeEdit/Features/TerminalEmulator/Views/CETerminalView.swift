@@ -17,6 +17,8 @@ private let terminalKillPreviousWord: [UInt8] = [0x1b, 0x7f]
 
 class CETerminalView: TerminalView {
     var performanceIdentifier: UUID?
+    private(set) var mirroredCursorIsVisible = true
+    private(set) var mirroredCursorStyle = CursorStyle.blinkBlock
     private var userIsReadingScrollback = false
     private var isForwardingFrameToSwiftTerm = false
     private var isSettlingAttachLayout = false
@@ -273,6 +275,21 @@ class CETerminalView: TerminalView {
         }
 
         return false
+    }
+
+    override func showCursor(source: Terminal) {
+        mirroredCursorIsVisible = true
+        super.showCursor(source: source)
+    }
+
+    override func hideCursor(source: Terminal) {
+        mirroredCursorIsVisible = false
+        super.hideCursor(source: source)
+    }
+
+    override func cursorStyleChanged(source: Terminal, newStyle: CursorStyle) {
+        mirroredCursorStyle = newStyle
+        super.cursorStyleChanged(source: source, newStyle: newStyle)
     }
 
     @objc

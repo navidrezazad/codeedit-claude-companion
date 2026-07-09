@@ -33,12 +33,21 @@ final class TerminalRemoteBridge {
     private let maxMarkdownBytes = 5 * 1024 * 1024
     private let maxMarkdownStreamBytes = 8 * 1024 * 1024
     private let maxEmbeddedImageBytes = 10 * 1024 * 1024
+    private let maxClientMessageBytes = 1 * 1024 * 1024
+    private let maxPendingClientSendBytes = 32 * 1024 * 1024
     private var listener: NWListener?
     private(set) var listeningPort: UInt16 = 0
     private var clients: [UUID: Client] = [:]
     private var publicIPAddress: String?
     private var publicIPAddressFetchInFlight = false
     private var publicIPAddressCompletionHandlers: [(String?) -> Void] = []
+    private lazy var sessionDescriptorsObserver = NotificationCenter.default.addObserver(
+        forName: .terminalSessionDescriptorsDidChange,
+        object: nil,
+        queue: .main
+    ) { [weak self] _ in
+        self?.broadcastSessions()
+    }
 
     private init() {
         _ = Self.currentPasscode()
@@ -71,6 +80,7 @@ final class TerminalRemoteBridge {
     }
 
     func start() {
+        _ = sessionDescriptorsObserver
         queue.async {
             guard self.listener == nil else {
                 return
@@ -189,6 +199,14 @@ final class TerminalRemoteBridge {
         }
 
         client.sendSessions()
+    }
+
+    private func broadcastSessions() {
+        queue.async {
+            self.clients.values
+                .filter(\.isAuthenticated)
+                .forEach { $0.sendSessions() }
+        }
     }
 
     private func attach(_ message: TerminalRemoteProtocol.ClientMessage, from client: Client) {
@@ -986,6 +1004,10 @@ private extension TerminalRemoteBridge {
         private var outputSubscriptions: [UUID: UUID] = [:]
         private var inputSubscriptions: [UUID: UUID] = [:]
         private var markdownStreams: [UUID: MarkdownStreamWatcher] = [:]
+        private var pendingSendFrames: [Data] = []
+        private var pendingSendByteCount = 0
+        private var isSendingFrame = false
+        private var isCancelled = false
 
         init(connection: NWConnection, bridge: TerminalRemoteBridge) {
             self.connection = connection
@@ -1021,12 +1043,18 @@ private extension TerminalRemoteBridge {
         }
 
         func cancel() {
+            guard !isCancelled else {
+                return
+            }
+            isCancelled = true
             let sessionIDs = Set(outputSubscriptions.keys).union(inputSubscriptions.keys)
             for sessionID in sessionIDs {
                 detach(from: sessionID)
             }
             markdownStreams.values.forEach { $0.cancel(sendFinalSnapshot: false) }
             markdownStreams.removeAll()
+            pendingSendFrames.removeAll()
+            pendingSendByteCount = 0
             connection.cancel()
         }
 
@@ -1035,17 +1063,59 @@ private extension TerminalRemoteBridge {
                 return
             }
 
+            bridge.queue.async { [weak self, weak bridge] in
+                guard let self, let bridge, !self.isCancelled else {
+                    return
+                }
+
+                self.enqueue(message, bridge: bridge)
+            }
+        }
+
+        private func enqueue(_ message: TerminalRemoteProtocol.ServerMessage, bridge: TerminalRemoteBridge) {
             do {
                 var data = try bridge.encoder.encode(message)
                 data.append(0x0a)
-                connection.send(content: data, completion: .contentProcessed { [weak self] error in
-                    if error != nil {
-                        self?.bridge?.removeClient(self?.id ?? UUID())
-                    }
-                })
+                guard pendingSendByteCount + data.count <= bridge.maxPendingClientSendBytes else {
+                    bridge.logger.error("Disconnecting a terminal remote client with a stalled send queue.")
+                    bridge.removeClient(id)
+                    return
+                }
+
+                pendingSendFrames.append(data)
+                pendingSendByteCount += data.count
+                sendNextFrameIfNeeded()
             } catch {
                 bridge.logger.error("Failed to encode terminal remote message: \(error.localizedDescription)")
             }
+        }
+
+        private func sendNextFrameIfNeeded() {
+            guard !isSendingFrame, !pendingSendFrames.isEmpty, !isCancelled else {
+                return
+            }
+
+            let data = pendingSendFrames.removeFirst()
+            pendingSendByteCount -= data.count
+            isSendingFrame = true
+            connection.send(content: data, completion: .contentProcessed { [weak self] error in
+                guard let self, let bridge = self.bridge else {
+                    return
+                }
+
+                bridge.queue.async { [weak self, weak bridge] in
+                    guard let self, let bridge, !self.isCancelled else {
+                        return
+                    }
+
+                    self.isSendingFrame = false
+                    if error != nil {
+                        bridge.removeClient(self.id)
+                    } else {
+                        self.sendNextFrameIfNeeded()
+                    }
+                }
+            })
         }
 
         func sendError(_ message: String) {
@@ -1192,12 +1262,13 @@ private extension TerminalRemoteBridge {
                     return
                 }
 
+                let otherSessionIDs = Set(self.outputSubscriptions.keys)
+                    .union(self.inputSubscriptions.keys)
+                    .filter { $0 != sessionID }
+                otherSessionIDs.forEach { self.detachOnMain(from: $0) }
+
                 if self.outputSubscriptions[sessionID] == nil {
                     self.outputSubscriptions[sessionID] = session.subscribeToProjectedOutput { [weak self] projection in
-                        guard projection.hasMeaningfulText else {
-                            return
-                        }
-
                         self?.bridge?.queue.async { [weak self] in
                             self?.send(
                                 .init(
@@ -1212,7 +1283,10 @@ private extension TerminalRemoteBridge {
 
                 if self.inputSubscriptions[sessionID] == nil {
                     self.inputSubscriptions[sessionID] = session.subscribeToInput { [weak self] bytes in
-                        self?.send(.init(type: .input, sessionID: sessionID, data: Data(bytes)))
+                        let data = Data(bytes)
+                        self?.bridge?.queue.async { [weak self] in
+                            self?.send(.init(type: .input, sessionID: sessionID, data: data))
+                        }
                     }
                 }
 
@@ -1238,9 +1312,18 @@ private extension TerminalRemoteBridge {
         ) -> TerminalRemoteProtocol.ProjectedOutput {
             TerminalRemoteProtocol.ProjectedOutput(
                 sequence: output.sequence,
+                generation: output.generation,
+                isSnapshot: output.isSnapshot,
                 screenMode: output.screenMode,
                 columns: output.columns,
                 terminalRows: output.terminalRows,
+                cursor: TerminalRemoteProtocol.ProjectedCursor(
+                    row: output.cursor.row,
+                    column: output.cursor.column,
+                    isVisible: output.cursor.isVisible,
+                    shape: output.cursor.shape,
+                    isBlinking: output.cursor.isBlinking
+                ),
                 rows: output.rows.map { row in
                     TerminalRemoteProtocol.ProjectedRow(
                         row: row.row,
@@ -1275,21 +1358,21 @@ private extension TerminalRemoteBridge {
 
         func detach(from sessionID: UUID) {
             DispatchQueue.main.async { [weak self] in
-                guard let self else {
-                    return
-                }
+                self?.detachOnMain(from: sessionID)
+            }
+        }
 
-                let outputToken = self.outputSubscriptions.removeValue(forKey: sessionID)
-                let inputToken = self.inputSubscriptions.removeValue(forKey: sessionID)
-                let session = TerminalSessionManager.shared.getSession(sessionID)
+        private func detachOnMain(from sessionID: UUID) {
+            let outputToken = outputSubscriptions.removeValue(forKey: sessionID)
+            let inputToken = inputSubscriptions.removeValue(forKey: sessionID)
+            let session = TerminalSessionManager.shared.getSession(sessionID)
 
-                if let outputToken {
-                    session?.unsubscribe(outputToken)
-                }
+            if let outputToken {
+                session?.unsubscribe(outputToken)
+            }
 
-                if let inputToken {
-                    session?.unsubscribe(inputToken)
-                }
+            if let inputToken {
+                session?.unsubscribe(inputToken)
             }
         }
 
@@ -1301,7 +1384,9 @@ private extension TerminalRemoteBridge {
 
                 if let data, !data.isEmpty {
                     self.receiveBuffer.append(data)
-                    self.processReceiveBuffer()
+                    guard self.processReceiveBuffer() else {
+                        return
+                    }
                 }
 
                 if isComplete || error != nil {
@@ -1313,13 +1398,19 @@ private extension TerminalRemoteBridge {
             }
         }
 
-        private func processReceiveBuffer() {
+        private func processReceiveBuffer() -> Bool {
             while let newlineIndex = receiveBuffer.firstIndex(of: 0x0a) {
                 let frame = receiveBuffer[..<newlineIndex]
                 receiveBuffer.removeSubrange(...newlineIndex)
 
                 guard !frame.isEmpty else {
                     continue
+                }
+
+                guard frame.count <= (bridge?.maxClientMessageBytes ?? 0) else {
+                    sendError("Terminal remote message is too large.")
+                    bridge?.removeClient(id)
+                    return false
                 }
 
                 do {
@@ -1331,6 +1422,14 @@ private extension TerminalRemoteBridge {
                     sendError("Invalid terminal remote message.")
                 }
             }
+
+            guard receiveBuffer.count <= (bridge?.maxClientMessageBytes ?? 0) else {
+                sendError("Terminal remote message is too large.")
+                bridge?.removeClient(id)
+                return false
+            }
+
+            return true
         }
 
         private func markdownStreamPreamble(prompt: String, streamFileURL: URL) -> String {

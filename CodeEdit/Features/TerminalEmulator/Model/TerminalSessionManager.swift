@@ -9,6 +9,12 @@ import Darwin
 import Foundation
 import SwiftTerm
 
+extension Notification.Name {
+    static let terminalSessionDescriptorsDidChange = Notification.Name(
+        "CodeEditV2.TerminalSessionDescriptorsDidChange"
+    )
+}
+
 protocol CELocalShellTerminalViewSessionDelegate: AnyObject {
     func terminalView(_ terminalView: CELocalShellTerminalView, didReceiveOutput bytes: ArraySlice<UInt8>)
     func terminalView(_ terminalView: CELocalShellTerminalView, didSendInput bytes: ArraySlice<UInt8>)
@@ -44,11 +50,22 @@ struct TerminalProjectedRow {
     }
 }
 
+struct TerminalProjectedCursor: Equatable {
+    let row: Int
+    let column: Int
+    let isVisible: Bool
+    let shape: TerminalRemoteProtocol.CursorShape
+    let isBlinking: Bool
+}
+
 struct TerminalProjectedOutput {
     let sequence: Int
+    let generation: Int
+    let isSnapshot: Bool
     let screenMode: TerminalRemoteProtocol.ScreenMode
     let columns: Int
     let terminalRows: Int
+    let cursor: TerminalProjectedCursor
     let rows: [TerminalProjectedRow]
 
     var text: String {
@@ -64,7 +81,7 @@ struct TerminalProjectedOutput {
     }
 }
 
-private struct RegisteredTerminalSession {
+private struct RegisteredTerminalSession: Equatable {
     var title: String
     var currentDirectory: URL?
     var shell: Shell?
@@ -88,9 +105,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var rawOutputSubscribers: [UUID: RawOutputHandler] = [:]
     private var projectedRows: [Int: ProjectedRowContent] = [:]
     private var projectedOutputSequence = 0
+    private var projectedOutputGeneration = 0
     private var lastProjectedColumns = 0
     private var lastProjectedRows = 0
+    private var lastProjectedCursor: TerminalProjectedCursor?
     private var pendingProjectedOutputRange: (startY: Int, endY: Int)?
+    private var pendingProjectedOutputIsSnapshot = false
+    private var pendingProjectedMetadataUpdate = false
     private var pendingProjectedOutputWorkItem: DispatchWorkItem?
     private var screenMode: TerminalRemoteProtocol.ScreenMode = .main
     private var terminalControlTail = ""
@@ -153,6 +174,8 @@ final class TerminalSession: ObservableObject, Identifiable {
             pendingProjectedOutputWorkItem?.cancel()
             pendingProjectedOutputWorkItem = nil
             pendingProjectedOutputRange = nil
+            pendingProjectedOutputIsSnapshot = false
+            pendingProjectedMetadataUpdate = false
         }
     }
 
@@ -166,8 +189,9 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func recentProjectedOutputSnapshot() -> TerminalProjectedOutput? {
         let terminal = view.getTerminal()
-        lastProjectedColumns = terminal.cols
-        lastProjectedRows = terminal.rows
+        if terminal.cols != lastProjectedColumns || terminal.rows != lastProjectedRows {
+            resetProjectionForDimensionChange(terminal)
+        }
 
         let startRow = terminal.buffer.yDisp
         let endRow = startRow + max(0, terminal.rows - 1)
@@ -181,11 +205,6 @@ final class TerminalSession: ObservableObject, Identifiable {
 
                 let content = Self.projectedRowContent(from: line)
                 projectedRows[row] = content
-
-                guard !content.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    continue
-                }
-
                 rows.append(TerminalProjectedRow(row: row, text: content.text, spans: content.spans))
             }
         }
@@ -194,11 +213,16 @@ final class TerminalSession: ObservableObject, Identifiable {
             return nil
         }
 
+        let cursor = projectedCursor(for: terminal)
+        lastProjectedCursor = cursor
         return TerminalProjectedOutput(
             sequence: projectedOutputSequence,
+            generation: projectedOutputGeneration,
+            isSnapshot: true,
             screenMode: screenMode,
             columns: terminal.cols,
             terminalRows: terminal.rows,
+            cursor: cursor,
             rows: rows
         )
     }
@@ -238,17 +262,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         let terminal = view.getTerminal()
         var recordedUpdate = false
 
-        // A window/pane resize reflows the whole SwiftTerm buffer, which renumbers the scroll-invariant
-        // row indices the mirror keys on. The wire protocol overwrites rows by index and has no
-        // "row removed" signal, so without this the iOS mirror keeps stale rows at the old indices and
-        // duplicates content. On a dimension change, resync: drop the change-detection cache, restart the
-        // sequence (so the mirror clears via its sequence-regression path), and re-mark the full screen so
-        // the current contents are re-sent under their new indices.
+        // A resize can renumber the scroll-invariant row indices. Start a new generation and send a
+        // complete visible snapshot so the remote never combines pre-reflow and post-reflow rows.
         if terminal.cols != lastProjectedColumns || terminal.rows != lastProjectedRows {
-            lastProjectedColumns = terminal.cols
-            lastProjectedRows = terminal.rows
-            projectedRows.removeAll(keepingCapacity: true)
-            projectedOutputSequence = 0
+            resetProjectionForDimensionChange(terminal)
+            pendingProjectedOutputIsSnapshot = true
+            pendingProjectedMetadataUpdate = true
             mergePendingProjectedOutputRange(
                 startY: terminal.buffer.yDisp,
                 endY: terminal.buffer.yDisp + max(0, terminal.rows - 1)
@@ -261,7 +280,15 @@ final class TerminalSession: ObservableObject, Identifiable {
             recordedUpdate = true
         }
 
-        guard recordedUpdate || pendingProjectedOutputRange != nil else {
+        if projectedCursor(for: terminal) != lastProjectedCursor {
+            pendingProjectedMetadataUpdate = true
+            recordedUpdate = true
+        }
+
+        guard recordedUpdate
+                || pendingProjectedOutputRange != nil
+                || pendingProjectedOutputIsSnapshot
+                || pendingProjectedMetadataUpdate else {
             return
         }
 
@@ -303,12 +330,13 @@ final class TerminalSession: ObservableObject, Identifiable {
             return
         }
 
-        guard let range = pendingProjectedOutputRange else {
-            return
-        }
+        let range = pendingProjectedOutputRange
+        let isSnapshot = pendingProjectedOutputIsSnapshot
         pendingProjectedOutputRange = nil
+        pendingProjectedOutputIsSnapshot = false
+        pendingProjectedMetadataUpdate = false
 
-        guard let projection = renderedOutputProjection(for: range) else {
+        guard let projection = renderedOutputProjection(for: range, isSnapshot: isSnapshot) else {
             return
         }
 
@@ -316,53 +344,101 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func renderedOutputProjection(
-        for range: (startY: Int, endY: Int)
+        for range: (startY: Int, endY: Int)?,
+        isSnapshot requestedSnapshot: Bool
     ) -> TerminalProjectedOutput? {
         let terminal = view.getTerminal()
-        var startRow = min(range.startY, range.endY)
-        var endRow = max(range.startY, range.endY)
+        var startRow = range.map { min($0.startY, $0.endY) }
+        var endRow = range.map { max($0.startY, $0.endY) }
+        var isSnapshot = requestedSnapshot
 
         if terminal.cols != lastProjectedColumns || terminal.rows != lastProjectedRows {
-            lastProjectedColumns = terminal.cols
-            lastProjectedRows = terminal.rows
-            projectedRows.removeAll(keepingCapacity: true)
-            projectedOutputSequence = 0
+            resetProjectionForDimensionChange(terminal)
+            isSnapshot = true
             startRow = terminal.buffer.yDisp
             endRow = terminal.buffer.yDisp + max(0, terminal.rows - 1)
         }
 
-        guard startRow <= endRow else {
-            return nil
-        }
-
         var rows: [TerminalProjectedRow] = []
 
-        for row in startRow...endRow {
-            guard let line = terminal.getScrollInvariantLine(row: row) else {
-                continue
-            }
+        if let startRow, let endRow, startRow <= endRow {
+            for row in startRow...endRow {
+                guard let line = terminal.getScrollInvariantLine(row: row) else {
+                    continue
+                }
 
-            let content = Self.projectedRowContent(from: line)
-            guard projectedRows[row] != content else {
-                continue
-            }
+                let content = Self.projectedRowContent(from: line)
+                guard projectedRows[row] != content else {
+                    continue
+                }
 
-            projectedRows[row] = content
-            rows.append(TerminalProjectedRow(row: row, text: content.text, spans: content.spans))
+                projectedRows[row] = content
+                rows.append(TerminalProjectedRow(row: row, text: content.text, spans: content.spans))
+            }
         }
 
-        guard !rows.isEmpty else {
+        let cursor = projectedCursor(for: terminal)
+        let cursorChanged = cursor != lastProjectedCursor
+        guard !rows.isEmpty || cursorChanged || isSnapshot else {
             return nil
         }
 
         trimProjectedRowsIfNeeded()
+        lastProjectedCursor = cursor
         projectedOutputSequence += 1
         return TerminalProjectedOutput(
             sequence: projectedOutputSequence,
+            generation: projectedOutputGeneration,
+            isSnapshot: isSnapshot,
             screenMode: screenMode,
             columns: terminal.cols,
             terminalRows: terminal.rows,
+            cursor: cursor,
             rows: rows
+        )
+    }
+
+    private func resetProjectionForDimensionChange(_ terminal: Terminal) {
+        lastProjectedColumns = terminal.cols
+        lastProjectedRows = terminal.rows
+        projectedRows.removeAll(keepingCapacity: true)
+        projectedOutputGeneration += 1
+        // Keep protocol-v1 clients functional while protocol v2 uses the generation as the authority.
+        projectedOutputSequence = 0
+    }
+
+    private func projectedCursor(for terminal: Terminal) -> TerminalProjectedCursor {
+        let location = terminal.getCursorLocation()
+        let shape: TerminalRemoteProtocol.CursorShape
+        let isBlinking: Bool
+
+        switch view.mirroredCursorStyle {
+        case .blinkBlock:
+            shape = .block
+            isBlinking = true
+        case .steadyBlock:
+            shape = .block
+            isBlinking = false
+        case .blinkUnderline:
+            shape = .underline
+            isBlinking = true
+        case .steadyUnderline:
+            shape = .underline
+            isBlinking = false
+        case .blinkBar:
+            shape = .bar
+            isBlinking = true
+        case .steadyBar:
+            shape = .bar
+            isBlinking = false
+        }
+
+        return TerminalProjectedCursor(
+            row: terminal.getTopVisibleRow() + location.y,
+            column: max(0, min(location.x, max(0, terminal.cols - 1))),
+            isVisible: view.mirroredCursorIsVisible,
+            shape: shape,
+            isBlinking: isBlinking
         )
     }
 
@@ -427,11 +503,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         let spans: [TerminalProjectedSpan]
     }
 
-    /// Builds the plain text and run-length-encoded styled spans for a SwiftTerm buffer line,
-    /// mirroring `translateToString(trimRight:)` while also capturing ANSI color/style.
+    /// Builds the plain text and run-length-encoded styled spans for a SwiftTerm buffer line.
+    /// Trailing default cells are omitted, but styled blank cells are retained because TUIs use
+    /// them for full-width backgrounds, selections, and status bars.
     private static func projectedRowContent(from line: BufferLine) -> ProjectedRowContent {
-        let trimmedLength = line.getTrimmedLength()
-        guard trimmedLength > 0 else {
+        var contentLength = line.count
+        while contentLength > 0, !line.hasContent(index: contentLength - 1) {
+            contentLength -= 1
+        }
+
+        guard contentLength > 0 else {
             return ProjectedRowContent(text: "", spans: [])
         }
 
@@ -456,7 +537,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
 
         var column = 0
-        while column < trimmedLength {
+        while column < contentLength {
             let cell = line[column]
             column += 1
 
@@ -620,15 +701,22 @@ final class TerminalSessionManager {
         currentDirectory: URL?,
         shell: Shell?
     ) {
-        if registeredSessions[id] == nil {
-            registeredSessionOrder.append(id)
-        }
-
-        registeredSessions[id] = RegisteredTerminalSession(
+        let registration = RegisteredTerminalSession(
             title: title,
             currentDirectory: currentDirectory,
             shell: shell
         )
+        let isNew = registeredSessions[id] == nil
+        let didChange = registeredSessions[id] != registration
+
+        if isNew {
+            registeredSessionOrder.append(id)
+        }
+
+        registeredSessions[id] = registration
+        if isNew || didChange {
+            notifySessionDescriptorsDidChange()
+        }
     }
 
     func ensureSession(_ id: UUID) -> TerminalSession? {
@@ -680,6 +768,7 @@ final class TerminalSessionManager {
             currentDirectory: currentDirectory,
             shell: resolvedShell
         )
+        notifySessionDescriptorsDidChange()
 
         return (session, true)
     }
@@ -711,18 +800,38 @@ final class TerminalSessionManager {
     }
 
     func updateSession(_ id: UUID, title: String) {
-        sessions[id]?.update(title: title)
+        var didChange = false
+        if let session = sessions[id], session.title != title {
+            session.update(title: title)
+            didChange = true
+        }
         if var registration = registeredSessions[id] {
-            registration.title = title
-            registeredSessions[id] = registration
+            if registration.title != title {
+                registration.title = title
+                registeredSessions[id] = registration
+                didChange = true
+            }
+        }
+        if didChange {
+            notifySessionDescriptorsDidChange()
         }
     }
 
     func updateSession(_ id: UUID, currentDirectory: URL) {
-        sessions[id]?.update(currentDirectory: currentDirectory)
+        var didChange = false
+        if let session = sessions[id], session.currentDirectory != currentDirectory {
+            session.update(currentDirectory: currentDirectory)
+            didChange = true
+        }
         if var registration = registeredSessions[id] {
-            registration.currentDirectory = currentDirectory
-            registeredSessions[id] = registration
+            if registration.currentDirectory != currentDirectory {
+                registration.currentDirectory = currentDirectory
+                registeredSessions[id] = registration
+                didChange = true
+            }
+        }
+        if didChange {
+            notifySessionDescriptorsDidChange()
         }
     }
 
@@ -740,11 +849,15 @@ final class TerminalSessionManager {
     }
 
     func removeSession(_ id: UUID) {
+        let didExist = sessions[id] != nil || registeredSessions[id] != nil
         sessions[id]?.view.sessionDelegate = nil
         sessions[id] = nil
         registeredSessions[id] = nil
         registeredSessionOrder.removeAll { $0 == id }
         configurationSignatures[id] = nil
+        if didExist {
+            notifySessionDescriptorsDidChange()
+        }
     }
 
     func terminateAndRemoveSession(_ id: UUID, signal: Int32 = SIGHUP) {
@@ -758,5 +871,9 @@ final class TerminalSessionManager {
 
     func cacheConfigurationSignature(_ signature: String, for id: UUID) {
         configurationSignatures[id] = signature
+    }
+
+    private func notifySessionDescriptorsDidChange() {
+        NotificationCenter.default.post(name: .terminalSessionDescriptorsDidChange, object: nil)
     }
 }
