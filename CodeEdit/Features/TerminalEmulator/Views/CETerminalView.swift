@@ -14,6 +14,7 @@ private let terminalFollowScrollThreshold = 0.985
 private let terminalBackwardDelete = String(NSEvent.SpecialKey.delete.unicodeScalar)
 private let terminalKillToBeginningOfLine: [UInt8] = [0x15]
 private let terminalKillPreviousWord: [UInt8] = [0x1b, 0x7f]
+private let terminalInteractiveRedrawWindow: TimeInterval = 0.35
 
 class CETerminalView: TerminalView {
     var performanceIdentifier: UUID?
@@ -23,6 +24,43 @@ class CETerminalView: TerminalView {
     private var isForwardingFrameToSwiftTerm = false
     private var isSettlingAttachLayout = false
     private var pendingAttachLayoutWorkItem: DispatchWorkItem?
+    private var interactiveRedrawDeadline = Date.distantPast
+    private var pendingInteractiveRedrawWorkItem: DispatchWorkItem?
+
+    func noteInteractiveInput(_ bytes: ArraySlice<UInt8>) {
+        guard !bytes.isEmpty, !bytes.contains(0x0a), !bytes.contains(0x0d) else {
+            return
+        }
+
+        interactiveRedrawDeadline = Date().addingTimeInterval(terminalInteractiveRedrawWindow)
+    }
+
+    func guaranteeInteractiveOutputDisplay() {
+        guard Date() <= interactiveRedrawDeadline,
+              pendingInteractiveRedrawWorkItem == nil,
+              superview != nil,
+              window != nil else {
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else {
+                return
+            }
+
+            self.pendingInteractiveRedrawWorkItem = nil
+            guard self.superview != nil, self.window != nil else {
+                return
+            }
+
+            // SwiftTerm normally invalidates only its changed rows. A stale row/frame mapping after
+            // reattachment can miss that rectangle, so guarantee one visible redraw for typed input.
+            self.setNeedsDisplay(self.bounds)
+            self.displayIfNeeded()
+        }
+        pendingInteractiveRedrawWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(17), execute: workItem)
+    }
 
     func prepareForAttachmentLayout() {
         pendingAttachLayoutWorkItem?.cancel()
@@ -197,6 +235,8 @@ class CETerminalView: TerminalView {
         if superview == nil {
             pendingAttachLayoutWorkItem?.cancel()
             pendingAttachLayoutWorkItem = nil
+            pendingInteractiveRedrawWorkItem?.cancel()
+            pendingInteractiveRedrawWorkItem = nil
             isSettlingAttachLayout = false
             if let performanceIdentifier {
                 TerminalPerformanceLog.mark("terminal detached \(performanceIdentifier)")

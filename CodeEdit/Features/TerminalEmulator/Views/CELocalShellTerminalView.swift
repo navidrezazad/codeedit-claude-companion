@@ -219,6 +219,7 @@ class CELocalShellTerminalView: CETerminalView, TerminalViewDelegate, LocalProce
     /// Passes data from the terminal to the shell.
     /// Eg, the user types characters, this forwards the data to the shell.
     public func send(source: TerminalView, data: ArraySlice<UInt8>) {
+        noteInteractiveInput(data)
         process.send(data: data)
         sessionDelegate?.terminalView(self, didSendInput: data)
     }
@@ -242,6 +243,7 @@ class CELocalShellTerminalView: CETerminalView, TerminalViewDelegate, LocalProce
         preserveScrollPositionIfNeeded {
             feed(byteArray: slice)
         }
+        guaranteeInteractiveOutputDisplay()
         sessionDelegate?.terminalViewDidRenderOutput(self)
     }
 
