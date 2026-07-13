@@ -12,7 +12,10 @@ import SwiftUI
 ///
 /// A model class to host and manage data for the Utility area.
 class UtilityAreaViewModel: ObservableObject {
+    private static let heightRestorationVersion = 1
+
     private var restorationSaveWorkItem: DispatchWorkItem?
+    private var restoredHeight: Double?
 
     private struct TerminalRestorationState: Codable {
         let terminals: [TerminalRestorationItem]
@@ -77,8 +80,14 @@ class UtilityAreaViewModel: ObservableObject {
 
     func restoreFromState(_ workspace: WorkspaceDocument) {
         isCollapsed = workspace.getFromWorkspaceState(.utilityAreaCollapsed) as? Bool ?? false
-        let restoredHeight = workspace.getFromWorkspaceState(.utilityAreaHeight) as? Double ?? 300.0
-        currentHeight = restoredHeight > 1 ? restoredHeight : 300.0
+        let savedHeight = workspace.getFromWorkspaceState(.utilityAreaHeight) as? Double
+        let savedHeightVersion = workspace.getFromWorkspaceState(.utilityAreaHeightVersion) as? Int
+        restoredHeight = if savedHeightVersion == Self.heightRestorationVersion {
+            savedHeight.flatMap { $0 > 1 && $0.isFinite ? $0 : nil }
+        } else {
+            nil
+        }
+        currentHeight = restoredHeight ?? 300.0
         isMaximized = workspace.getFromWorkspaceState(.utilityAreaMaximized) as? Bool ?? false
 
         guard
@@ -99,12 +108,24 @@ class UtilityAreaViewModel: ObservableObject {
         }
     }
 
+    func preferredStartupHeight(
+        totalHeight: CGFloat,
+        minimumHeight: CGFloat,
+        minimumPrimaryPaneHeight: CGFloat
+    ) -> CGFloat {
+        let maximumHeight = max(0, totalHeight - minimumPrimaryPaneHeight)
+        let effectiveMinimumHeight = min(minimumHeight, maximumHeight)
+        let requestedHeight = restoredHeight.map { CGFloat($0) } ?? totalHeight / 3
+        return min(max(requestedHeight, effectiveMinimumHeight), maximumHeight)
+    }
+
     func saveRestorationState(_ workspace: WorkspaceDocument) {
         restorationSaveWorkItem?.cancel()
         restorationSaveWorkItem = nil
 
         workspace.addToWorkspaceState(key: .utilityAreaCollapsed, value: isCollapsed)
         workspace.addToWorkspaceState(key: .utilityAreaHeight, value: currentHeight)
+        workspace.addToWorkspaceState(key: .utilityAreaHeightVersion, value: Self.heightRestorationVersion)
         workspace.addToWorkspaceState(key: .utilityAreaMaximized, value: isMaximized)
 
         let state = TerminalRestorationState(

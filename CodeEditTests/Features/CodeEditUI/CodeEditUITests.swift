@@ -7,9 +7,50 @@
 
 @testable import CodeEdit
 import Foundation
+import QuickLookUI
 import SnapshotTesting
 import SwiftUI
 import XCTest
+
+final class ImageFileViewTests: XCTestCase {
+
+    func testImagePreviewFillsAvailableArea() throws {
+        try withTempDir { directory in
+            let imageURL = directory.appending(path: "image.png")
+            let bitmap = try XCTUnwrap(
+                NSBitmapImageRep(
+                    bitmapDataPlanes: nil,
+                    pixelsWide: 10,
+                    pixelsHigh: 10,
+                    bitsPerSample: 8,
+                    samplesPerPixel: 4,
+                    hasAlpha: true,
+                    isPlanar: false,
+                    colorSpaceName: .deviceRGB,
+                    bytesPerRow: 0,
+                    bitsPerPixel: 0
+                )
+            )
+            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: imageURL)
+
+            let hosting = NSHostingView(rootView: ImageFileView(imageURL))
+            hosting.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
+            hosting.layoutSubtreeIfNeeded()
+
+            let preview = try XCTUnwrap(findSubview(of: QLPreviewView.self, in: hosting))
+            XCTAssertEqual(preview.frame.width, 800, accuracy: 1)
+            XCTAssertEqual(preview.frame.height, 600, accuracy: 1)
+        }
+    }
+
+    private func findSubview<ViewType: NSView>(of type: ViewType.Type, in view: NSView) -> ViewType? {
+        if let view = view as? ViewType {
+            return view
+        }
+
+        return view.subviews.lazy.compactMap { self.findSubview(of: type, in: $0) }.first
+    }
+}
 
 final class CodeEditUIUnitTests: XCTestCase {
 

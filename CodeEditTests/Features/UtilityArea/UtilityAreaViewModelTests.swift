@@ -110,4 +110,63 @@ final class UtilityAreaViewModelTests: XCTestCase {
         model.initializeTerminals(workspaceURL: rootURL)
         XCTAssertEqual(model.terminals.count, 1)
     }
+
+    func testDefaultStartupHeightUsesOneThirdOfAvailableHeight() {
+        XCTAssertEqual(
+            model.preferredStartupHeight(
+                totalHeight: 900,
+                minimumHeight: 100,
+                minimumPrimaryPaneHeight: 228
+            ),
+            300
+        )
+    }
+
+    func testStartupHeightRestoresSavedHeight() {
+        let workspace = WorkspaceDocument()
+        workspace.addToWorkspaceState(key: .utilityAreaHeight, value: 420.0)
+        workspace.addToWorkspaceState(key: .utilityAreaHeightVersion, value: 1)
+        model.restoreFromState(workspace)
+
+        XCTAssertEqual(
+            model.preferredStartupHeight(
+                totalHeight: 900,
+                minimumHeight: 100,
+                minimumPrimaryPaneHeight: 228
+            ),
+            420
+        )
+    }
+
+    func testStartupHeightPreservesMinimumEditorHeight() {
+        let workspace = WorkspaceDocument()
+        workspace.addToWorkspaceState(key: .utilityAreaHeight, value: 1_000.0)
+        workspace.addToWorkspaceState(key: .utilityAreaHeightVersion, value: 1)
+        model.restoreFromState(workspace)
+
+        XCTAssertEqual(
+            model.preferredStartupHeight(
+                totalHeight: 900,
+                minimumHeight: 100,
+                minimumPrimaryPaneHeight: 228
+            ),
+            672
+        )
+    }
+
+    func testLegacySavedHeightUsesNewOneThirdDefault() {
+        let workspace = WorkspaceDocument()
+        workspace.addToWorkspaceState(key: .utilityAreaHeight, value: 450.0)
+        workspace.addToWorkspaceState(key: .utilityAreaHeightVersion, value: nil)
+        model.restoreFromState(workspace)
+
+        XCTAssertEqual(
+            model.preferredStartupHeight(
+                totalHeight: 900,
+                minimumHeight: 100,
+                minimumPrimaryPaneHeight: 228
+            ),
+            300
+        )
+    }
 }

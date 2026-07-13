@@ -11,11 +11,16 @@ struct SplitViewControllerView: NSViewControllerRepresentable {
 
     var axis: Axis
     var dividerStyle: CodeEditDividerStyle
+    var initialTrailingPaneSize: ((CGFloat) -> CGFloat)?
     var children: _VariadicView.Children
     @Binding var viewController: () -> SplitViewController?
 
     func makeNSViewController(context: Context) -> SplitViewController {
-        let controller = SplitViewController(axis: axis, parentView: self) { controller in
+        let controller = SplitViewController(
+            axis: axis,
+            initialTrailingPaneSize: initialTrailingPaneSize,
+            parentView: self
+        ) { controller in
             updateItems(controller: controller)
         }
         return controller
@@ -24,6 +29,7 @@ struct SplitViewControllerView: NSViewControllerRepresentable {
     func updateNSViewController(_ controller: SplitViewController, context: Context) {
         updateItems(controller: controller)
         controller.setDividerStyle(dividerStyle)
+        controller.initialTrailingPaneSize = initialTrailingPaneSize
     }
 
     private func updateItems(controller: SplitViewController) {
@@ -111,11 +117,19 @@ final class SplitViewController: NSSplitViewController {
     var items: [SplitViewItem] = []
     var axis: Axis
     var parentView: SplitViewControllerView?
+    var initialTrailingPaneSize: ((CGFloat) -> CGFloat)?
 
     var setUpItems: ((SplitViewController) -> Void)?
+    private var didApplyInitialTrailingPaneSize = false
 
-    init(axis: Axis, parentView: SplitViewControllerView?, setUpItems: ((SplitViewController) -> Void)?) {
+    init(
+        axis: Axis,
+        initialTrailingPaneSize: ((CGFloat) -> CGFloat)?,
+        parentView: SplitViewControllerView?,
+        setUpItems: ((SplitViewController) -> Void)?
+    ) {
         self.axis = axis
+        self.initialTrailingPaneSize = initialTrailingPaneSize
         self.parentView = parentView
         self.setUpItems = setUpItems
         super.init(nibName: nil, bundle: nil)
@@ -141,6 +155,11 @@ final class SplitViewController: NSSplitViewController {
         }
     }
 
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        applyInitialTrailingPaneSizeIfNeeded()
+    }
+
     override func splitView(_ splitView: NSSplitView, shouldHideDividerAt dividerIndex: Int) -> Bool {
         // For some reason, AppKit _really_ wants to hide dividers when there's only one item (and no dividers)
         // so we do this check for them.
@@ -153,6 +172,25 @@ final class SplitViewController: NSSplitViewController {
             return
         }
         splitView.customDividerStyle = dividerStyle
+    }
+
+    private func applyInitialTrailingPaneSizeIfNeeded() {
+        guard !didApplyInitialTrailingPaneSize,
+              splitViewItems.count == 2,
+              !splitViewItems[1].isCollapsed,
+              let initialTrailingPaneSize else {
+            return
+        }
+
+        let totalSize = splitView.isVertical ? splitView.bounds.width : splitView.bounds.height
+        guard totalSize > splitView.dividerThickness else { return }
+
+        let maximumPaneSize = totalSize - splitView.dividerThickness
+        let paneSize = min(max(initialTrailingPaneSize(totalSize), 0), maximumPaneSize)
+        let dividerPosition = totalSize - paneSize - splitView.dividerThickness
+        splitView.setPosition(dividerPosition, ofDividerAt: 0)
+        splitView.setPosition(dividerPosition, ofDividerAt: 0)
+        didApplyInitialTrailingPaneSize = true
     }
 
     func collapse(for id: AnyHashable, enabled: Bool) {

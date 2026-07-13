@@ -10,11 +10,18 @@ import SwiftUI
 struct SplitView<Content: View>: View {
     var axis: Axis
     var dividerStyle: CodeEditDividerStyle
+    var initialTrailingPaneSize: ((CGFloat) -> CGFloat)?
     var content: Content
 
-    init(axis: Axis, dividerStyle: CodeEditDividerStyle = .system(.thin), @ViewBuilder content: () -> Content) {
+    init(
+        axis: Axis,
+        dividerStyle: CodeEditDividerStyle = .system(.thin),
+        initialTrailingPaneSize: ((CGFloat) -> CGFloat)? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
         self.axis = axis
         self.dividerStyle = dividerStyle
+        self.initialTrailingPaneSize = initialTrailingPaneSize
         self.content = content()
     }
 
@@ -26,6 +33,7 @@ struct SplitView<Content: View>: View {
                 SplitViewControllerView(
                     axis: axis,
                     dividerStyle: dividerStyle,
+                    initialTrailingPaneSize: initialTrailingPaneSize,
                     children: children,
                     viewController: $viewController
                 )

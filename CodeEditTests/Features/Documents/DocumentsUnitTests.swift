@@ -145,4 +145,22 @@ final class DocumentsUnitTests: XCTestCase {
             hapticFeedbackPerformerMock.reset()
         }
     }
+
+    func testSplitViewInitialTrailingPaneUsesRequestedSize() {
+        let controller = SplitViewController(
+            axis: .vertical,
+            initialTrailingPaneSize: { $0 / 3 },
+            parentView: nil,
+            setUpItems: nil
+        )
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 600, height: 900)
+        controller.addSplitViewItem(NSSplitViewItem(viewController: NSViewController()))
+        controller.addSplitViewItem(NSSplitViewItem(viewController: NSViewController()))
+
+        controller.view.layoutSubtreeIfNeeded()
+        controller.viewDidLayout()
+
+        XCTAssertEqual(controller.splitView.subviews[1].frame.height, 300, accuracy: 1)
+    }
 }

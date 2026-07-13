@@ -36,6 +36,8 @@ struct WorkspaceView: View {
     @State private var drawerHeight: CGFloat = 0
 
     private let statusbarHeight: CGFloat = 29
+    private let minimumEditorAreaHeight: CGFloat = 170 + 29 + 29
+    private let minimumUtilityAreaHeight: CGFloat = 100
 
     private var keybindings: KeybindingManager =  .shared
 
@@ -43,10 +45,20 @@ struct WorkspaceView: View {
         if workspace.workspaceFileManager != nil, let sourceControlManager = workspace.sourceControlManager {
             VStack {
                 SplitViewReader { proxy in
-                    SplitView(axis: .vertical) {
-                        editorArea
-                        utilityAreaPlaceholder
-                    }
+                    SplitView(
+                        axis: .vertical,
+                        initialTrailingPaneSize: { totalHeight in
+                            utilityAreaViewModel.preferredStartupHeight(
+                                totalHeight: totalHeight,
+                                minimumHeight: minimumUtilityAreaHeight,
+                                minimumPrimaryPaneHeight: minimumEditorAreaHeight
+                            )
+                        },
+                        content: {
+                            editorArea
+                            utilityAreaPlaceholder
+                        }
+                    )
                     .edgesIgnoringSafeArea(.top)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .overlay(alignment: .top) {
@@ -87,7 +99,7 @@ struct WorkspaceView: View {
                     .task {
                         // Only refresh git data if source control is enabled
                         guard sourceControlIsEnabled else { return }
-                        
+
                         do {
                             try await sourceControlManager.refreshRemotes()
                             try await sourceControlManager.refreshStashEntries()
@@ -151,7 +163,7 @@ struct WorkspaceView: View {
                 }
             }
         }
-        .frame(minHeight: 170 + 29 + 29)
+        .frame(minHeight: minimumEditorAreaHeight)
         .collapsable()
         .collapsed($utilityAreaViewModel.isMaximized)
         .holdingPriority(.init(1))
@@ -185,7 +197,7 @@ struct WorkspaceView: View {
             .splitViewCanAnimate($utilityAreaViewModel.animateCollapse)
             .opacity(0)
             .frame(idealHeight: 260)
-            .frame(minHeight: 100)
+            .frame(minHeight: minimumUtilityAreaHeight)
             .background {
                 GeometryReader { geo in
                     Rectangle()

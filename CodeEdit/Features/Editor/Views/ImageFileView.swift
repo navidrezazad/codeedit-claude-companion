@@ -7,16 +7,13 @@
 
 import SwiftUI
 
-/// A view for previewing an image, while respecting its dimensions.
+/// A view for previewing an image in the full available editor area.
 ///
 /// It receives a URL to an image file and attempts to preview it.
 ///
 /// ```swift
 /// ImageFileView(imageURL)
 /// ```
-/// This implementation allows for proper image scaling, especially when the image dimensions are smaller than
-/// the size of the image view area.
-///
 /// If the preview image cannot be created, it shows a  *"Cannot preview image"* text.
 struct ImageFileView: View {
 
@@ -28,22 +25,10 @@ struct ImageFileView: View {
     }
 
     var body: some View {
-        if let nsImage = NSImage(contentsOf: imageURL),
-           let imageReps = nsImage.representations.first {
-
-            let pixelWidth = CGFloat(imageReps.pixelsWide)
-            let pixelHeight = CGFloat(imageReps.pixelsHigh)
-
+        if NSImage(contentsOf: imageURL) != nil {
             GeometryReader { proxy in
-                ZStack {
-                    AnyFileView(imageURL)
-                        .frame(
-                            maxWidth: min(pixelWidth, proxy.size.width, nsImage.size.width),
-                            maxHeight: min(pixelHeight, proxy.size.height, nsImage.size.height)
-                        )
-
-                }
-                .frame(width: proxy.size.width, height: proxy.size.height)
+                AnyFileView(imageURL)
+                    .frame(width: proxy.size.width, height: proxy.size.height)
             }
         } else {
             Text("Cannot preview image")
