@@ -15,6 +15,8 @@ import OSLog
 
 // swiftlint:disable:next type_body_length
 final class Editor: ObservableObject, Identifiable {
+    private static let largeFileWarningThreshold = 10_000_000
+
     enum EditorError: Error {
         case noWorkspaceAttached
     }
@@ -24,6 +26,8 @@ final class Editor: ObservableObject, Identifiable {
     /// Set of open tabs.
     @Published var tabs: OrderedSet<Tab> = [] {
         didSet {
+            guard !isRestoringTabs else { return }
+
             let change = tabs.symmetricDifference(oldValue)
 
             if tabs.count > oldValue.count {
@@ -66,6 +70,8 @@ final class Editor: ObservableObject, Identifiable {
     weak var workspace: WorkspaceDocument?
 
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "", category: "Editor")
+    private var approvedLargeFileURLs = Set<URL>()
+    private var isRestoringTabs = false
 
     init() {
         self.tabs = []
@@ -103,9 +109,21 @@ final class Editor: ObservableObject, Identifiable {
         self.tabs = []
         self.parent = parent
         self.workspace = workspace
-        files.forEach { openTab(tab: $0) }
+        if workspace != nil {
+            files.forEach { openTab(tab: $0) }
+        } else {
+            self.tabs = files
+        }
         self.selectedTab = selectedTab ?? tabs.first
         self.temporaryTab = temporaryTab
+    }
+
+    func restoreTabs(_ restoredTabs: OrderedSet<Tab>, selectedTab: Tab?) {
+        isRestoringTabs = true
+        tabs = restoredTabs
+        isRestoringTabs = false
+        self.selectedTab = nil
+        setSelectedTab(selectedTab)
     }
 
     /// Closes the editor.
@@ -126,6 +144,9 @@ final class Editor: ObservableObject, Identifiable {
             return
         }
         guard let tab = self.tabs.first(where: { $0.file == file }) else {
+            return
+        }
+        guard confirmOpeningLargeFileIfNeeded(tab.file) else {
             return
         }
         self.selectedTab = tab
@@ -150,6 +171,9 @@ final class Editor: ObservableObject, Identifiable {
             return
         }
 
+        guard confirmOpeningLargeFileIfNeeded(tab.file) else {
+            return
+        }
         self.selectedTab = tab
         if tab.file.fileDocument == nil {
             do { // Ignore this error for simpler API usage.
@@ -272,6 +296,9 @@ final class Editor: ObservableObject, Identifiable {
             openTab(file: file)
             return
         }
+        guard confirmOpeningLargeFileIfNeeded(file) else {
+            return
+        }
 
         let source = markdownTab(for: file, presentation: .source)
         let preview = markdownTab(for: file, presentation: .markdownPreview)
@@ -307,6 +334,10 @@ final class Editor: ObservableObject, Identifiable {
     ///   - item: the tab to open.
     ///   - asTemporary: indicates whether the tab should be opened as a temporary tab or a permanent tab.
     func openTab(tab item: Tab, asTemporary: Bool) {
+        guard confirmOpeningLargeFileIfNeeded(item.file) else {
+            return
+        }
+
         // Item is already opened in a tab.
         guard !tabs.contains(item) || !asTemporary else {
             let existingItem = tabs.first(where: { $0 == item }) ?? item
@@ -383,6 +414,10 @@ final class Editor: ObservableObject, Identifiable {
     ///   - index: Index where the tab needs to be added. If nil, it is added to the back.
     ///   - fromHistory: Indicates whether the tab has been opened from going back in history.
     func openTab(tab item: Tab, at index: Int? = nil, fromHistory: Bool = false) {
+        guard confirmOpeningLargeFileIfNeeded(item.file) else {
+            return
+        }
+
         if let existingItem = tabs.first(where: { $0 == item }) {
             selectedTab = existingItem
             if !fromHistory {
@@ -430,6 +465,35 @@ final class Editor: ObservableObject, Identifiable {
         }
 
         try item.file.loadCodeFile()
+    }
+
+    private func confirmOpeningLargeFileIfNeeded(_ file: CEWorkspaceFile) -> Bool {
+        guard file.fileDocument == nil, !approvedLargeFileURLs.contains(file.resolvedURL) else {
+            return true
+        }
+
+        guard let fileSize = try? file.resolvedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              fileSize > Self.largeFileWarningThreshold else {
+            return true
+        }
+
+        let formattedSize = ByteCountFormatter.string(fromByteCount: Int64(fileSize), countStyle: .file)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Open Large File?"
+        alert.informativeText = """
+            "\(file.name)" is \(formattedSize). Opening files larger than 10 MB may make the editor slow or \
+            unresponsive.
+            """
+        alert.addButton(withTitle: "Open Anyway")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return false
+        }
+
+        approvedLargeFileURLs.insert(file.resolvedURL)
+        return true
     }
 
     /// Check if tab can be closed

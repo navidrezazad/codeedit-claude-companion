@@ -11,10 +11,7 @@ extension ProjectNavigatorViewController: NSOutlineViewDataSource {
     /// Retrieves the children of a given item for the outline view, applying the current filter if necessary.
     private func getOutlineViewItems(for item: CEWorkspaceFile) -> [CEWorkspaceFile] {
         if let cachedChildren = filteredContentChildren[item] {
-            return cachedChildren
-                .sorted { lhs, rhs in
-                    workspace?.sortFoldersOnTop == true ? lhs.isFolder && !rhs.isFolder : lhs.name < rhs.name
-                }
+            return sortedOutlineItems(cachedChildren)
         }
 
         if let workspace, let children = workspace.workspaceFileManager?.childrenOfFile(item) {
@@ -28,16 +25,28 @@ extension ProjectNavigatorViewController: NSOutlineViewDataSource {
                 }
 
                 filteredContentChildren[item] = filteredChildren
-                return filteredChildren
+                return sortedOutlineItems(filteredChildren)
             }
 
-            return children
-                .sorted { lhs, rhs in
-                    workspace.sortFoldersOnTop ? lhs.isFolder && !rhs.isFolder : lhs.name < rhs.name
-                }
+            return sortedOutlineItems(children)
         }
 
         return []
+    }
+
+    private func sortedOutlineItems(_ items: [CEWorkspaceFile]) -> [CEWorkspaceFile] {
+        items.sorted { lhs, rhs in
+            if workspace?.sortFoldersOnTop != false, lhs.isFolder != rhs.isFolder {
+                return lhs.isFolder
+            }
+
+            let comparison = lhs.name.localizedStandardCompare(rhs.name)
+            if comparison != .orderedSame {
+                return comparison == .orderedAscending
+            }
+
+            return lhs.name < rhs.name
+        }
     }
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {

@@ -96,28 +96,30 @@ extension EditorManager {
     ///   - fileManager: The file manager to use to map files.a
     private func fixEditor(_ editor: Editor, workspace: WorkspaceDocument) throws {
         guard let fileManager = workspace.workspaceFileManager else { return }
+        let selectedURL = editor.selectedTab?.file.url
+        let selectedPresentation = editor.selectedTab?.presentation
         let resolvedTabs = editor
             .tabs
-            .compactMap({ fileManager.getFile($0.file.url.path(percentEncoded: false), createIfNotFound: true) })
-            .map({ EditorInstance(workspace: workspace, file: $0) })
-
-        for tab in resolvedTabs {
-            try tab.file.loadCodeFile()
+            .compactMap { tab -> EditorInstance? in
+                guard let file = fileManager.getFile(
+                    tab.file.url.path(percentEncoded: false),
+                    createIfNotFound: true
+                ) else {
+                    return nil
+                }
+                return EditorInstance(
+                    workspace: workspace,
+                    file: file,
+                    presentation: tab.presentation,
+                    cursorPositions: tab.cursorPositions
+                )
         }
 
         editor.workspace = workspace
-        editor.tabs = OrderedSet(resolvedTabs)
-
-        if let selectedTab = editor.selectedTab {
-            if let resolvedFile = fileManager.getFile(
-                selectedTab.file.url.path(percentEncoded: false),
-                createIfNotFound: true
-            ) {
-                editor.setSelectedTab(resolvedFile)
-            } else {
-                editor.setSelectedTab(nil as Editor.Tab?)
-            }
+        let selectedTab = resolvedTabs.first {
+            $0.file.url == selectedURL && $0.presentation == selectedPresentation
         }
+        editor.restoreTabs(OrderedSet(resolvedTabs), selectedTab: selectedTab)
     }
 
     func saveRestorationState(_ workspace: WorkspaceDocument) {
@@ -221,20 +223,38 @@ extension SplitViewData: Codable {
 extension Editor: Codable {
     enum CodingKeys: String, CodingKey {
         case tabs
+        case tabPresentations
         case selectedTab
+        case selectedTabPresentation
         case id
     }
 
     convenience init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let fileURLs = try container.decode([URL].self, forKey: .tabs)
+        let presentations = try container.decodeIfPresent(
+            [EditorInstance.Presentation].self,
+            forKey: .tabPresentations
+        )
         let selectedTab = try? container.decode(URL.self, forKey: .selectedTab)
+        let selectedPresentation = try container.decodeIfPresent(
+            EditorInstance.Presentation.self,
+            forKey: .selectedTabPresentation
+        )
         let id = try container.decode(UUID.self, forKey: .id)
+        let restoredTabs = fileURLs.enumerated().map { index, url in
+            EditorInstance(
+                workspace: nil,
+                file: CEWorkspaceFile(url: url),
+                presentation: presentations?[safe: index] ?? Self.defaultPresentation(for: url)
+            )
+        }
         self.init(
-            files: OrderedSet(fileURLs.map { CEWorkspaceFile(url: $0) }),
+            files: OrderedSet(restoredTabs),
             selectedTab: selectedTab == nil ? nil : EditorInstance(
                 workspace: nil,
-                file: CEWorkspaceFile(url: selectedTab!)
+                file: CEWorkspaceFile(url: selectedTab!),
+                presentation: selectedPresentation ?? Self.defaultPresentation(for: selectedTab!)
             ),
             parent: nil,
             workspace: nil
@@ -245,7 +265,13 @@ extension Editor: Codable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(tabs.map { $0.file.url }, forKey: .tabs)
+        try container.encode(tabs.map(\.presentation), forKey: .tabPresentations)
         try container.encode(selectedTab?.file.url, forKey: .selectedTab)
+        try container.encode(selectedTab?.presentation, forKey: .selectedTabPresentation)
         try container.encode(id, forKey: .id)
+    }
+
+    private static func defaultPresentation(for url: URL) -> EditorInstance.Presentation {
+        url.isMarkdownDocument ? .markdownPreview : .source
     }
 }

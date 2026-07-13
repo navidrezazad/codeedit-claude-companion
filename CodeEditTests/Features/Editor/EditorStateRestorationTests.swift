@@ -7,10 +7,42 @@
 
 import Testing
 import Foundation
+import OrderedCollections
 @testable import CodeEdit
 
 @Suite
 struct EditorStateRestorationTests {
+    private struct LegacyEditorState: Codable {
+        let tabs: [URL]
+        let selectedTab: URL
+        let id: UUID
+    }
+
+    @Test
+    func preservesMarkdownTabPresentations() throws {
+        let url = URL(fileURLWithPath: "/tmp/readme.md")
+        let file = CEWorkspaceFile(url: url)
+        let source = EditorInstance(workspace: nil, file: file, presentation: .source)
+        let preview = EditorInstance(workspace: nil, file: file, presentation: .markdownPreview)
+        let editor = Editor(files: OrderedSet([source, preview]), selectedTab: preview)
+
+        let restored = try JSONDecoder().decode(Editor.self, from: JSONEncoder().encode(editor))
+
+        #expect(restored.tabs.map(\.presentation) == [.source, .markdownPreview])
+        #expect(restored.selectedTab?.presentation == .markdownPreview)
+    }
+
+    @Test
+    func legacyMarkdownTabsRestoreAsPreview() throws {
+        let url = URL(fileURLWithPath: "/tmp/readme.md")
+        let legacyState = LegacyEditorState(tabs: [url], selectedTab: url, id: UUID())
+
+        let restored = try JSONDecoder().decode(Editor.self, from: JSONEncoder().encode(legacyState))
+
+        #expect(restored.tabs.first?.presentation == .markdownPreview)
+        #expect(restored.selectedTab?.presentation == .markdownPreview)
+    }
+
     @Test
     func createsDatabase() throws {
         try withTempDir { dir in

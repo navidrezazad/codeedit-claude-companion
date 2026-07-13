@@ -10,6 +10,7 @@ import SwiftUI
 
 final class CodeEditSplitViewController: NSSplitViewController {
     static let minSidebarWidth: CGFloat = 242
+    static let maxSidebarWidth: CGFloat = 360
     static let maxSnapWidth: CGFloat = snapWidth + 10
     static let snapWidth: CGFloat = 272
     static let minSnapWidth: CGFloat = snapWidth - 10
@@ -102,6 +103,7 @@ final class CodeEditSplitViewController: NSSplitViewController {
         }
         navigator.isSpringLoaded = true
         navigator.minimumThickness = Self.minSidebarWidth
+        navigator.maximumThickness = Self.maxSidebarWidth
         navigator.collapseBehavior = .useConstraints
         return navigator
     }
@@ -122,7 +124,9 @@ final class CodeEditSplitViewController: NSSplitViewController {
         guard let workspace else { return }
 
         let navigatorWidth = workspace.getFromWorkspaceState(.splitViewWidth) as? CGFloat
-        splitView.setPosition(navigatorWidth ?? Self.minSidebarWidth, ofDividerAt: 0)
+        let restoredWidth = navigatorWidth.flatMap { $0.isFinite ? $0 : nil } ?? Self.snapWidth
+        let constrainedWidth = min(max(restoredWidth, Self.minSidebarWidth), Self.maxSidebarWidth)
+        splitView.setPosition(constrainedWidth, ofDividerAt: 0)
 
         if let firstSplitView = splitViewItems.first {
             firstSplitView.isCollapsed = workspace.getFromWorkspaceState(
@@ -164,7 +168,7 @@ final class CodeEditSplitViewController: NSSplitViewController {
                 return 0
             } else {
                 hapticCollapse(splitViewItems.first, collapseAction: false)
-                return max(Self.minSidebarWidth, proposedPosition)
+                return min(Self.maxSidebarWidth, max(Self.minSidebarWidth, proposedPosition))
             }
         case 1:
             let proposedWidth = view.frame.width - proposedPosition

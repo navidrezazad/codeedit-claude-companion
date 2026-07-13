@@ -94,7 +94,7 @@ final class DocumentsUnitTests: XCTestCase {
             )
 
             // Then
-            XCTAssertEqual(result, .init(position))
+            XCTAssertEqual(result, min(position, CodeEditSplitViewController.maxSidebarWidth))
         }
     }
 
