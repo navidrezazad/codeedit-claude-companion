@@ -458,6 +458,13 @@ struct ContentView: View {
                             }
                         }
                     }
+                    .contextMenu {
+                        Button {
+                            UIPasteboard.general.string = file.path
+                        } label: {
+                            Label("Copy Full Path", systemImage: "doc.on.doc")
+                        }
+                    }
                 }
             }
         }
