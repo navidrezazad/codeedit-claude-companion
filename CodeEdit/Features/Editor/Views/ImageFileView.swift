@@ -27,7 +27,7 @@ struct ImageFileView: View {
     var body: some View {
         if NSImage(contentsOf: imageURL) != nil {
             GeometryReader { proxy in
-                AnyFileView(imageURL)
+                AnyFileView(imageURL, allowsCopyingImage: true)
                     .frame(width: proxy.size.width, height: proxy.size.height)
             }
         } else {
@@ -35,4 +35,16 @@ struct ImageFileView: View {
         }
     }
 
+}
+
+enum ImagePasteboardWriter {
+    @discardableResult
+    static func copyImage(at imageURL: URL, to pasteboard: NSPasteboard = .general) -> Bool {
+        guard let image = NSImage(contentsOf: imageURL) else {
+            return false
+        }
+
+        pasteboard.clearContents()
+        return pasteboard.writeObjects([image])
+    }
 }

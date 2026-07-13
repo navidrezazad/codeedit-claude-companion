@@ -17,21 +17,7 @@ final class ImageFileViewTests: XCTestCase {
     func testImagePreviewFillsAvailableArea() throws {
         try withTempDir { directory in
             let imageURL = directory.appending(path: "image.png")
-            let bitmap = try XCTUnwrap(
-                NSBitmapImageRep(
-                    bitmapDataPlanes: nil,
-                    pixelsWide: 10,
-                    pixelsHigh: 10,
-                    bitsPerSample: 8,
-                    samplesPerPixel: 4,
-                    hasAlpha: true,
-                    isPlanar: false,
-                    colorSpaceName: .deviceRGB,
-                    bytesPerRow: 0,
-                    bitsPerPixel: 0
-                )
-            )
-            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: imageURL)
+            try writeTestImage(to: imageURL)
 
             let hosting = NSHostingView(rootView: ImageFileView(imageURL))
             hosting.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
@@ -41,6 +27,52 @@ final class ImageFileViewTests: XCTestCase {
             XCTAssertEqual(preview.frame.width, 800, accuracy: 1)
             XCTAssertEqual(preview.frame.height, 600, accuracy: 1)
         }
+    }
+
+    func testImagePreviewProvidesCopyImageContextMenu() throws {
+        try withTempDir { directory in
+            let imageURL = directory.appending(path: "image.png")
+            try writeTestImage(to: imageURL)
+
+            let hosting = NSHostingView(rootView: ImageFileView(imageURL))
+            hosting.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
+            hosting.layoutSubtreeIfNeeded()
+
+            let preview = try XCTUnwrap(findSubview(of: QLPreviewView.self, in: hosting))
+            let copyItem = try XCTUnwrap(preview.menu?.items.first { $0.title == "Copy Image" })
+            XCTAssertNotNil(copyItem.action)
+            XCTAssertNotNil(copyItem.target)
+        }
+    }
+
+    func testCopyImageWritesReadableImageToPasteboard() throws {
+        try withTempDir { directory in
+            let imageURL = directory.appending(path: "image.png")
+            try writeTestImage(to: imageURL)
+            let pasteboard = NSPasteboard(name: .init("ImageFileViewTests.\(UUID().uuidString)"))
+            defer { pasteboard.clearContents() }
+
+            XCTAssertTrue(ImagePasteboardWriter.copyImage(at: imageURL, to: pasteboard))
+            XCTAssertNotNil(NSImage(pasteboard: pasteboard))
+        }
+    }
+
+    private func writeTestImage(to imageURL: URL) throws {
+        let bitmap = try XCTUnwrap(
+            NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: 10,
+                pixelsHigh: 10,
+                bitsPerSample: 8,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bytesPerRow: 0,
+                bitsPerPixel: 0
+            )
+        )
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: imageURL)
     }
 
     private func findSubview<ViewType: NSView>(of type: ViewType.Type, in view: NSView) -> ViewType? {
